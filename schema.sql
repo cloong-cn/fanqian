@@ -48,3 +48,18 @@ CREATE TABLE IF NOT EXISTS login_fails (
   count      int NOT NULL,
   first_at   timestamptz NOT NULL
 );
+
+-- 操作日志：谁、什么时候、对谁的账户、做了什么
+CREATE TABLE IF NOT EXISTS audit_log (
+  id             serial PRIMARY KEY,
+  at             timestamptz NOT NULL DEFAULT now(),
+  actor_id       int REFERENCES users(id) ON DELETE SET NULL,
+  target_user_id int REFERENCES users(id) ON DELETE SET NULL,
+  action         text NOT NULL,
+  detail         text NOT NULL DEFAULT '',
+  data           jsonb
+);
+CREATE INDEX IF NOT EXISTS audit_target ON audit_log(target_user_id, id DESC);
+
+-- 被管理员改过的消费记录做个标记，用户自己能看到
+ALTER TABLE expenses ADD COLUMN IF NOT EXISTS admin_edited boolean NOT NULL DEFAULT false;

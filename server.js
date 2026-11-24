@@ -126,7 +126,21 @@ function canEditDay(user, day) {
   return day <= today && day >= addDays(today, -1);
 }
 function rowExpense(r) {
-  return { id: r.id, userId: r.user_id, day: r.day, meal: r.meal, item: r.item, cents: r.cents };
+  return { id: r.id, userId: r.user_id, day: r.day, meal: r.meal, item: r.item, cents: r.cents,
+    time: r.time || null, adminEdited: !!r.admin_edited };
+}
+// 查询消费记录时统一取的列
+const EXP_COLS = `id,user_id,to_char(day,'YYYY-MM-DD') AS day,meal,item,cents,admin_edited,
+  to_char(created_at AT TIME ZONE '${TZ}','HH24:MI') AS time`;
+
+// ---------- 操作日志 ----------
+const MEAL_CN = { breakfast: '早餐', lunch: '午餐', dinner: '晚餐', other: '其他' };
+const fmtY = (c) => (c < 0 ? '-' : '') + '¥' + (Math.abs(c) / 100).toFixed(2);
+const fmtD = (d) => `${Number(d.slice(5, 7))}月${Number(d.slice(8))}日`;
+const expDesc = (r) => `${fmtD(r.day)} ${MEAL_CN[r.meal]}${r.item ? '（' + r.item + '）' : ''} ${fmtY(r.cents)}`;
+async function audit(q, actorId, targetUserId, action, detail, data = null) {
+  await q.query(`INSERT INTO audit_log(actor_id,target_user_id,action,detail,data) VALUES($1,$2,$3,$4,$5)`,
+    [actorId, targetUserId, action, detail, data ? JSON.stringify(data) : null]);
 }
 
 // ---------- 路由 ----------
@@ -177,6 +191,7 @@ route('GET', '/api/me', async ({ user }) => {
     user: { id: user.id, username: user.username, displayName: user.display_name, isAdmin: user.is_admin },
     today: todayStr(),
     lowBalanceCents: LOW_BALANCE_CENTS,
+    todayAllCents: Number((await db.query(`SELECT COALESCE(SUM(cents),0) AS c FROM expenses WHERE day=$1`, [todayStr()])).rows[0].c),
     ...(await balances(user.id)),
   };
 });
@@ -187,6 +202,7 @@ route('POST', '/api/password', async ({ user, body }) => {
   const pw = String(body.new ?? '');
   if (pw.length < 6 || pw.length > 100) throw bad('新密码至少 6 位');
   await db.query(`UPDATE users SET pw_hash=$1 WHERE id=$2`, [hashPassword(pw), user.id]);
+  await audit(db, user.id, user.id, 'user.password', '自己修改了密码');
   return { ok: true };
 });
 
@@ -196,7 +212,7 @@ route('GET', '/api/day', async ({ user, query }) => {
   if (!validDay(day)) throw bad('日期不对');
   const uid = targetUserId(user, query.get('user_id'));
   const { rows } = await db.query(
-    `SELECT id,user_id,to_char(day,'YYYY-MM-DD') AS day,meal,item,cents FROM expenses
+    `SELECT ${EXP_COLS} FROM expenses
      WHERE user_id=$1 AND day=$2 ORDER BY id`, [uid, day]);
   return { day, editable: canEditDay(user, day), items: rows.map(rowExpense) };
 });
@@ -215,19 +231,21 @@ route('POST', '/api/expenses', async ({ user, body }) => {
   if (!validDay(day)) throw bad('日期不对');
   if (!canEditDay(user, day)) throw new HttpError(403, '只能记今天和昨天的账');
   if (!MEALS.includes(body.meal)) throw bad('请选择早餐 / 午餐 / 晚餐');
-  const item = cleanText(body.item, 40) || '未命名';
+  const item = cleanText(body.item, 40);
   const cents = parseAmount(body.amount);
   if (!cents) throw bad('金额不对');
   const uid = targetUserId(user, body.user_id);
   const { rows: [r] } = await db.query(
-    `INSERT INTO expenses(user_id,day,meal,item,cents) VALUES($1,$2,$3,$4,$5)
-     RETURNING id,user_id,to_char(day,'YYYY-MM-DD') AS day,meal,item,cents`, [uid, day, body.meal, item, cents]);
+    `INSERT INTO expenses(user_id,day,meal,item,cents,admin_edited) VALUES($1,$2,$3,$4,$5,$6)
+     RETURNING ${EXP_COLS}`, [uid, day, body.meal, item, cents, uid !== user.id]);
+  // 自己记账不写日志（记录本身就是痕迹）；替别人记才写
+  if (uid !== user.id) await audit(db, user.id, uid, 'expense.create', `替对方新增 ${expDesc(r)}`, { after: rowExpense(r) });
   return rowExpense(r);
 });
 
 async function loadOwnExpense(user, id) {
   const { rows: [r] } = await db.query(
-    `SELECT id,user_id,to_char(day,'YYYY-MM-DD') AS day,meal,item,cents FROM expenses WHERE id=$1`, [id]);
+    `SELECT ${EXP_COLS} FROM expenses WHERE id=$1`, [id]);
   if (!r || (r.user_id !== user.id && !user.is_admin)) throw new HttpError(404, '记录不存在');
   if (!canEditDay(user, r.day)) throw new HttpError(403, '这条记录太早了，不能再修改，请联系管理员');
   return r;
@@ -237,18 +255,27 @@ route('PUT', '/api/expenses/:id', async ({ user, params, body }) => {
   const r = await loadOwnExpense(user, params.id);
   const meal = body.meal ?? r.meal;
   if (!MEALS.includes(meal)) throw bad('餐次不对');
-  const item = body.item !== undefined ? (cleanText(body.item, 40) || '未命名') : r.item;
+  const item = body.item !== undefined ? cleanText(body.item, 40) : r.item;
   const cents = body.amount !== undefined ? parseAmount(body.amount) : r.cents;
   if (!cents) throw bad('金额不对');
+  if (meal === r.meal && item === r.item && cents === r.cents) return rowExpense(r);
+  const byOther = r.user_id !== user.id;
   const { rows: [n] } = await db.query(
-    `UPDATE expenses SET meal=$1,item=$2,cents=$3,updated_at=now() WHERE id=$4
-     RETURNING id,user_id,to_char(day,'YYYY-MM-DD') AS day,meal,item,cents`, [meal, item, cents, r.id]);
+    `UPDATE expenses SET meal=$1,item=$2,cents=$3,updated_at=now(),admin_edited = admin_edited OR $5 WHERE id=$4
+     RETURNING ${EXP_COLS}`, [meal, item, cents, r.id, byOther]);
+  const changes = [];
+  if (cents !== r.cents) changes.push(`金额 ${fmtY(r.cents)} → ${fmtY(cents)}`);
+  if (meal !== r.meal) changes.push(`餐次 ${MEAL_CN[r.meal]} → ${MEAL_CN[meal]}`);
+  if (item !== r.item) changes.push(`内容「${r.item || '空'}」→「${item || '空'}」`);
+  await audit(db, user.id, r.user_id, 'expense.update', `修改 ${fmtD(r.day)} ${MEAL_CN[r.meal]}：${changes.join('，')}`,
+    { before: rowExpense(r), after: rowExpense(n) });
   return rowExpense(n);
 });
 
 route('DELETE', '/api/expenses/:id', async ({ user, params }) => {
   const r = await loadOwnExpense(user, params.id);
   await db.query(`DELETE FROM expenses WHERE id=$1`, [r.id]);
+  await audit(db, user.id, r.user_id, 'expense.delete', `删除 ${expDesc(r)}`, { before: rowExpense(r) });
   return { ok: true };
 });
 
@@ -259,7 +286,7 @@ route('GET', '/api/history', async ({ user, query }) => {
   const uid = targetUserId(user, query.get('user_id'));
   const from = month + '-01';
   const { rows } = await db.query(
-    `SELECT id,user_id,to_char(day,'YYYY-MM-DD') AS day,meal,item,cents FROM expenses
+    `SELECT ${EXP_COLS} FROM expenses
      WHERE user_id=$1 AND day >= $2::date AND day < ($2::date + interval '1 month')
      ORDER BY day DESC, id`, [uid, from]);
   const days = new Map();
@@ -310,7 +337,7 @@ route('GET', '/api/analytics', async ({ user, query }) => {
   const [daily, meals, items, weekday, prev, monthly] = await Promise.all([
     db.query(`SELECT to_char(day,'YYYY-MM-DD') AS day, SUM(cents)::int AS cents FROM expenses WHERE ${W} GROUP BY day`, args),
     db.query(`SELECT meal, SUM(cents)::int AS cents, COUNT(*)::int AS n FROM expenses WHERE ${W} GROUP BY meal`, args),
-    db.query(`SELECT item, SUM(cents)::int AS cents, COUNT(*)::int AS n FROM expenses WHERE ${W}
+    db.query(`SELECT item, SUM(cents)::int AS cents, COUNT(*)::int AS n FROM expenses WHERE ${W} AND item <> ''
               GROUP BY item ORDER BY SUM(cents) DESC, COUNT(*) DESC LIMIT 8`, args),
     db.query(`SELECT EXTRACT(ISODOW FROM day)::int AS dow, SUM(cents)::int AS cents FROM expenses WHERE ${W} GROUP BY 1`, args),
     db.query(`SELECT COALESCE(SUM(cents),0)::int AS cents FROM expenses
@@ -489,12 +516,14 @@ route('POST', '/api/topups', async ({ user, body }) => {
   if (p.n >= 3) throw bad('已有 3 条待确认的充值，请等管理员确认');
   await db.query(`INSERT INTO topups(user_id,cents,note,status,created_by) VALUES($1,$2,$3,'pending',$1)`,
     [user.id, cents, cleanText(body.note, 60)]);
+  await audit(db, user.id, user.id, 'topup.request', `申请充值 ${fmtY(cents)}`);
   return { ok: true };
 });
 route('DELETE', '/api/topups/:id', async ({ user, params }) => {
-  const { rowCount } = await db.query(
-    `DELETE FROM topups WHERE id=$1 AND user_id=$2 AND status='pending'`, [params.id, user.id]);
-  if (!rowCount) throw new HttpError(404, '找不到这条待确认的充值');
+  const { rows: [t] } = await db.query(
+    `DELETE FROM topups WHERE id=$1 AND user_id=$2 AND status='pending' RETURNING cents`, [params.id, user.id]);
+  if (!t) throw new HttpError(404, '找不到这条待确认的充值');
+  await audit(db, user.id, user.id, 'topup.cancel', `撤回充值申请 ${fmtY(t.cents)}`);
   return { ok: true };
 });
 
@@ -514,7 +543,7 @@ route('GET', '/api/admin/users', async () => {
   }));
 }, { auth: 'admin' });
 
-route('POST', '/api/admin/users', async ({ body }) => {
+route('POST', '/api/admin/users', async ({ user, body }) => {
   const username = cleanText(body.username, 40).toLowerCase();
   if (!/^[a-z0-9_]{2,20}$/.test(username)) throw bad('用户名只能用 2-20 位小写字母、数字、下划线');
   const displayName = cleanText(body.displayName, 20) || username;
@@ -524,6 +553,7 @@ route('POST', '/api/admin/users', async ({ body }) => {
     const { rows: [u] } = await db.query(
       `INSERT INTO users(username,display_name,pw_hash,is_admin) VALUES($1,$2,$3,$4) RETURNING id`,
       [username, displayName, hashPassword(password), !!body.isAdmin]);
+    await audit(db, user.id, u.id, 'user.create', `新建用户 ${displayName}（${username}）${body.isAdmin ? '，管理员' : ''}`);
     return { id: u.id, username, password };
   } catch (e) {
     if (e.code === '23505') throw bad('用户名已存在');
@@ -540,11 +570,18 @@ route('PUT', '/api/admin/users/:id', async ({ user, params, body }) => {
     const n = cleanText(body.displayName, 20);
     if (!n) throw bad('名字不能为空');
     await db.query(`UPDATE users SET display_name=$1 WHERE id=$2`, [n, id]);
+    if (n !== u.display_name) await audit(db, user.id, id, 'user.rename', `改名 ${u.display_name} → ${n}`);
   }
   if (body.disabled !== undefined || body.isAdmin !== undefined) {
     if (id === user.id) throw bad('不能停用或降级自己');
-    if (body.disabled !== undefined) await db.query(`UPDATE users SET disabled=$1 WHERE id=$2`, [!!body.disabled, id]);
-    if (body.isAdmin !== undefined) await db.query(`UPDATE users SET is_admin=$1 WHERE id=$2`, [!!body.isAdmin, id]);
+    if (body.disabled !== undefined) {
+      await db.query(`UPDATE users SET disabled=$1 WHERE id=$2`, [!!body.disabled, id]);
+      await audit(db, user.id, id, body.disabled ? 'user.disable' : 'user.enable', body.disabled ? '停用账号' : '启用账号');
+    }
+    if (body.isAdmin !== undefined) {
+      await db.query(`UPDATE users SET is_admin=$1 WHERE id=$2`, [!!body.isAdmin, id]);
+      await audit(db, user.id, id, 'user.role', body.isAdmin ? '设为管理员' : '取消管理员');
+    }
     await db.query(`DELETE FROM sessions WHERE user_id=$1`, [id]);
   }
   if (body.resetPassword) {
@@ -552,6 +589,7 @@ route('PUT', '/api/admin/users/:id', async ({ user, params, body }) => {
     if (pw.length < 6 || pw.length > 100) throw bad('密码至少 6 位');
     await db.query(`UPDATE users SET pw_hash=$1 WHERE id=$2`, [hashPassword(pw), id]);
     if (id !== user.id) await db.query(`DELETE FROM sessions WHERE user_id=$1`, [id]);
+    await audit(db, user.id, id, 'user.resetpw', '重置了密码');
     out.password = pw;
   }
   return out;
@@ -600,6 +638,8 @@ route('POST', '/api/admin/topups', async ({ user, body }) => {
     }
     await client.query(`INSERT INTO topups(user_id,cents,note,status,created_by,decided_at) VALUES($1,$2,$3,'done',$4,now())`,
       [uid, cents, finalNote, user.id]);
+    await audit(client, user.id, uid, body.setTo !== undefined ? 'balance.set' : 'balance.adjust',
+      body.setTo !== undefined ? finalNote : `${cents > 0 ? '充值' : '扣减'} ${fmtY(cents)}${note ? '：' + note : ''}`);
     await client.query('COMMIT');
     return { ok: true, cents };
   } catch (e) {
@@ -610,16 +650,18 @@ route('POST', '/api/admin/topups', async ({ user, body }) => {
   }
 }, { auth: 'admin' });
 
-route('POST', '/api/admin/topups/:id/approve', async ({ params }) => {
-  const { rowCount } = await db.query(
-    `UPDATE topups SET status='done',decided_at=now() WHERE id=$1 AND status='pending'`, [params.id]);
-  if (!rowCount) throw new HttpError(404, '找不到待确认的记录');
+route('POST', '/api/admin/topups/:id/approve', async ({ user, params }) => {
+  const { rows: [t] } = await db.query(
+    `UPDATE topups SET status='done',decided_at=now() WHERE id=$1 AND status='pending' RETURNING user_id,cents`, [params.id]);
+  if (!t) throw new HttpError(404, '找不到待确认的记录');
+  await audit(db, user.id, t.user_id, 'topup.approve', `确认充值 ${fmtY(t.cents)} 已入账`);
   return { ok: true };
 }, { auth: 'admin' });
-route('POST', '/api/admin/topups/:id/reject', async ({ params }) => {
-  const { rowCount } = await db.query(
-    `UPDATE topups SET status='rejected',decided_at=now() WHERE id=$1 AND status='pending'`, [params.id]);
-  if (!rowCount) throw new HttpError(404, '找不到待确认的记录');
+route('POST', '/api/admin/topups/:id/reject', async ({ user, params }) => {
+  const { rows: [t] } = await db.query(
+    `UPDATE topups SET status='rejected',decided_at=now() WHERE id=$1 AND status='pending' RETURNING user_id,cents`, [params.id]);
+  if (!t) throw new HttpError(404, '找不到待确认的记录');
+  await audit(db, user.id, t.user_id, 'topup.reject', `拒绝充值申请 ${fmtY(t.cents)}`);
   return { ok: true };
 }, { auth: 'admin' });
 
@@ -631,11 +673,35 @@ route('GET', '/api/admin/expenses', async ({ query }) => {
   const args = [from, to]; let extra = '';
   if (query.get('user_id')) { args.push(Number(query.get('user_id'))); extra = ` AND e.user_id=$3`; }
   const { rows } = await db.query(`
-    SELECT e.id,e.user_id,u.display_name,to_char(e.day,'YYYY-MM-DD') AS day,e.meal,e.item,e.cents
+    SELECT e.id,e.user_id,u.display_name,to_char(e.day,'YYYY-MM-DD') AS day,e.meal,e.item,e.cents,e.admin_edited,
+      to_char(e.created_at AT TIME ZONE '${TZ}','HH24:MI') AS time
     FROM expenses e JOIN users u ON u.id=e.user_id
     WHERE e.day >= $1 AND e.day <= $2 ${extra}
     ORDER BY e.day DESC, u.id, e.id LIMIT 2000`, args);
   return rows.map((r) => ({ ...rowExpense(r), displayName: r.display_name }));
+}, { auth: 'admin' });
+
+// ---------- 日志查询 ----------
+function rowAudit(r) {
+  return { id: r.id, at: r.at, action: r.action, detail: r.detail, actor: r.actor_name, actorId: r.actor_id,
+    target: r.target_name, targetId: r.target_user_id };
+}
+const AUDIT_SQL = `SELECT a.*, ua.display_name AS actor_name, ut.display_name AS target_name
+  FROM audit_log a LEFT JOIN users ua ON ua.id=a.actor_id LEFT JOIN users ut ON ut.id=a.target_user_id`;
+// 别人（管理员）对我账户做过的事
+route('GET', '/api/audit/mine', async ({ user }) => {
+  const { rows } = await db.query(`${AUDIT_SQL} WHERE a.target_user_id=$1 AND a.actor_id IS DISTINCT FROM $1
+    ORDER BY a.id DESC LIMIT 200`, [user.id]);
+  return rows.map(rowAudit);
+});
+// 管理员看全部日志：可按用户筛选，可只看"管理员动了别人的账"
+route('GET', '/api/admin/audit', async ({ query }) => {
+  const args = []; const where = [];
+  if (query.get('user_id')) { args.push(Number(query.get('user_id'))); where.push(`(a.target_user_id=$${args.length} OR a.actor_id=$${args.length})`); }
+  if (query.get('others') === '1') where.push(`a.actor_id IS DISTINCT FROM a.target_user_id`);
+  const { rows } = await db.query(`${AUDIT_SQL} ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
+    ORDER BY a.id DESC LIMIT 300`, args);
+  return rows.map(rowAudit);
 }, { auth: 'admin' });
 
 // ---------- 静态文件 ----------

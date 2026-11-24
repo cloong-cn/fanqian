@@ -197,10 +197,11 @@ function heroCard(monthCents) {
     <div class="label">我的余额 ${flags.join('')}</div>
     <div class="big num ${me.balanceCents < 0 ? 'neg' : ''}"><span class="cur">¥</span>${countSpan(me.balanceCents, 'bal', { cur: false })}</div>
     <button class="pill" data-go="#/topup">充值</button>
-    <div class="row3">
+    <div class="row4">
       <div><div class="k">账户总余额</div><div class="v num">${countSpan(me.poolCents, 'pool')}</div></div>
-      <div><div class="k">本月已花</div><div class="v num">${countSpan(monthCents, 'month')}</div></div>
-      <div><div class="k">今日已花</div><div class="v num" id="hero-today">—</div></div>
+      <div><div class="k">今日大家共花</div><div class="v num">${countSpan(me.todayAllCents, 'today-all')}</div></div>
+      <div><div class="k">我本月已花</div><div class="v num">${countSpan(monthCents, 'month')}</div></div>
+      <div><div class="k">我今日已花</div><div class="v num" id="hero-today">—</div></div>
     </div>
   </section>`;
 }
@@ -232,7 +233,7 @@ async function renderHome() {
         <div class="sum num ${sum ? '' : 'zero'}">${sum ? yuan(sum) : '未记'}</div>
         ${editable ? `<button class="add-btn" data-add="${m.key}" aria-label="添加${m.name}">${icon('plus')}</button>` : ''}
       </div>
-      ${items.length ? `<ul class="items">${items.map((x) => `<li data-id="${x.id}" class="${editable ? '' : 'ro'} ${x.id === lastAddedId ? 'new' : ''}"><span class="name">${esc(x.item)}</span><span class="amt num">${yuan(x.cents)}</span></li>`).join('')}</ul>` : ''}
+      ${items.length ? `<ul class="items">${items.map((x) => `<li data-id="${x.id}" class="${editable ? '' : 'ro'} ${x.id === lastAddedId ? 'new' : ''}">${itemLabel(x)}<span class="amt num">${yuan(x.cents)}</span></li>`).join('')}</ul>` : ''}
     </section>`;
   }).join('');
 
@@ -271,15 +272,15 @@ async function renderHome() {
 function addSheet(meal, suggest) {
   const chipsFor = (m) => {
     const own = suggest.filter((s) => s.meal === m);
-    const list = (own.length ? own : suggest).slice(0, 8);
-    return list.length ? `<div class="field"><label>常吃的，点一下直接记</label><div class="chips">${list.map((c) =>
-      `<button type="button" class="chip" data-i="${suggest.indexOf(c)}">${esc(c.item)}<span class="p num">${yuan(c.cents)}</span></button>`).join('')}</div></div>` : '';
+    const seen = new Set();
+    const list = (own.length ? own : suggest).filter((c) => { const k = c.item + '|' + c.cents; if (seen.has(k)) return false; seen.add(k); return true; }).slice(0, 8);
+    return list.length ? `<div class="field"><label>常用金额，点一下直接记</label><div class="chips">${list.map((c) =>
+      `<button type="button" class="chip num" data-i="${suggest.indexOf(c)}">${c.item ? esc(c.item) + '<span class="p">' + yuan(c.cents) + '</span>' : yuan(c.cents)}</button>`).join('')}</div></div>` : '';
   };
   openSheet(`<h2>记一笔 · ${md(state.day)}</h2>
     <div class="field"><div class="seg full" id="ms">${MEALS.map((m) => `<button type="button" data-m="${m.key}" class="${m.key === meal ? 'on' : ''}">${m.name}</button>`).join('')}</div></div>
     <form id="af">
       <div class="field money-input"><span>¥</span><input name="amount" inputmode="decimal" placeholder="0" autocomplete="off" required autofocus></div>
-      <div class="field"><input name="item" placeholder="吃了什么（可不填）" maxlength="40" autocomplete="off"></div>
       <div id="chips">${chipsFor(meal)}</div>
       <button class="btn block">记下</button>
     </form>`, (s) => {
@@ -296,7 +297,7 @@ function addSheet(meal, suggest) {
     s.querySelector('#af').addEventListener('submit', (e) => {
       e.preventDefault();
       const fd = new FormData(e.target);
-      submitExpense(meal, fd.get('item'), fd.get('amount'));
+      submitExpense(meal, '', fd.get('amount'));
     });
   });
 }
@@ -315,18 +316,18 @@ function editExpense(x, after) {
   openSheet(`<h2>修改记录</h2>
     <div class="field"><div class="seg full" id="ms">${MEALS.map((m) => `<button type="button" data-m="${m.key}" class="${m.key === x.meal ? 'on' : ''}">${m.name}</button>`).join('')}</div></div>
     <div class="field money-input"><span>¥</span><input id="ea" inputmode="decimal" value="${amountInput(x.cents)}"></div>
-    <div class="field"><input id="ei" maxlength="40" value="${esc(x.item)}" placeholder="吃了什么"></div>
+    ${x.item ? `<div class="small muted" style="margin:-4px 2px 10px">内容：${esc(x.item)}</div>` : ''}
     <div class="btns"><button class="btn danger" id="del">删除</button><button class="btn" id="save">保存</button></div>`, (s) => {
     let meal = x.meal;
     s.querySelectorAll('[data-m]').forEach((b) => b.onclick = () => { meal = b.dataset.m; s.querySelectorAll('[data-m]').forEach((o) => o.classList.toggle('on', o === b)); });
     s.querySelector('#save').onclick = async () => {
       try {
-        await api('PUT', '/api/expenses/' + x.id, { meal, item: s.querySelector('#ei').value, amount: s.querySelector('#ea').value.trim() });
+        await api('PUT', '/api/expenses/' + x.id, { meal, amount: s.querySelector('#ea').value.trim() });
         closeSheet(); suggestCache = null; await refreshMe(); await after(); toast('已保存');
       } catch (e) { fail(e); }
     };
     s.querySelector('#del').onclick = async () => {
-      if (!confirm(`删除「${x.item} ${yuan(x.cents)}」？`)) return;
+      if (!confirm(`删除这笔 ${MEAL_NAME[x.meal]} ${yuan(x.cents)}？`)) return;
       try {
         await api('DELETE', '/api/expenses/' + x.id); closeSheet(); suggestCache = null;
         const li = $app.querySelector(`[data-id="${x.id}"]`);
@@ -346,10 +347,15 @@ function dayCards(days, { editable, who } = {}) {
       const ro = !(editable && (d.editable ?? true));
       return `<li data-id="${x.id}" class="${ro ? 'ro' : ''}" style="${mealVar(x.meal)}">
         <span class="mdot"></span><span class="tag">${MEAL_NAME[x.meal]}</span>
-        <span class="name">${who && x.displayName ? `<span class="muted">${esc(x.displayName)} · </span>` : ''}${esc(x.item)}</span>
+        ${itemLabel(x, who && x.displayName ? `<span class="muted">${esc(x.displayName)} · </span>` : '')}
         <span class="amt num">${yuan(x.cents)}</span></li>`;
     }).join('')}</ul>
   </section>`).join('');
+}
+// 记录名：有内容显示内容，没有就显示记账时间；管理员改过的加标记
+function itemLabel(x, prefix = '') {
+  const main = x.item ? esc(x.item) : `<span class="muted">${x.time ? x.time + ' 记' : '一笔'}</span>`;
+  return `<span class="name">${prefix}${main}${x.adminEdited ? '<span class="badge wait">管理员改过</span>' : ''}</span>`;
 }
 const emptyState = (text) => `<div class="card empty-state">${icon('bowl')}${text}</div>`;
 
@@ -643,6 +649,7 @@ function renderMe() {
     <div class="card flush"><ul class="list">
       <li data-go="#/topup"><span class="meal-icon" style="--m: var(--accent)">${icon('wallet')}</span><div class="main"><div class="t">充值</div><div class="d">申请充值、查看充值记录</div></div>${me.pendingCents ? `<span class="badge wait">${yuan(me.pendingCents)} 待确认</span>` : ''}${icon('chev', 'chev')}</li>
       <li id="pw"><span class="meal-icon" style="--m: var(--m-lunch)">${icon('key')}</span><div class="main"><div class="t">修改密码</div></div>${icon('chev', 'chev')}</li>
+      <li data-go="#/log"><span class="meal-icon" style="--m: var(--m-other)">${icon('history')}</span><div class="main"><div class="t">账户变动记录</div><div class="d">管理员对我账户做过的操作</div></div>${icon('chev', 'chev')}</li>
       <li id="xls"><span class="meal-icon" style="--m: var(--good)">${icon('excel')}</span><div class="main"><div class="t">导出 Excel</div><div class="d">下载消费明细和汇总表</div></div>${icon('chev', 'chev')}</li>
       <li id="a2hs"><span class="meal-icon" style="--m: var(--m-dinner)">${icon('phone')}</span><div class="main"><div class="t">添加到手机桌面</div><div class="d">像 App 一样打开</div></div>${icon('chev', 'chev')}</li>
     </ul></div>
@@ -667,16 +674,32 @@ function renderMe() {
   document.getElementById('lo').onclick = async () => { await api('POST', '/api/logout', {}).catch(() => {}); me = null; location.hash = '#/'; renderLogin(); };
 }
 
+// ---------- 操作日志 ----------
+function auditList(rows, { showTarget = false } = {}) {
+  if (!rows.length) return `<div class="card empty-state">${icon('history')}还没有记录</div>`;
+  return `<div class="card flush"><ul class="list">${rows.map((r) => `<li style="cursor:default;align-items:flex-start">
+    <div class="avatar" style="width:34px;height:34px;font-size:14px">${initial(r.actor || '?')}</div>
+    <div class="main"><div class="t" style="font-size:14px">${esc(r.detail)}</div>
+      <div class="d">${fmtTime(r.at)} · ${esc(r.actor || '已删除用户')}${showTarget && r.targetId && r.targetId !== r.actorId ? ' → ' + esc(r.target || '') : ''}</div></div></li>`).join('')}</ul></div>`;
+}
+async function renderMyLog() {
+  const rows = await api('GET', '/api/audit/mine');
+  shell('me', `<header class="top"><div><a href="#/me" class="small">‹ 我的</a><div class="title">账户变动记录</div></div></header>
+    <p class="small muted" style="margin:-6px 2px 12px">管理员对你的账户做过的所有操作（充值确认、调整余额、修改或删除你的记录等）都会记在这里，不能删除。</p>
+    ${auditList(rows)}`);
+}
+
 // ---------- 管理 ----------
 async function renderAdmin() {
   const tab = state.adminTab;
   const pending = await api('GET', '/api/admin/topups?status=pending');
-  const tabs = [['users', '用户'], ['topups', '充值审批'], ['expenses', '消费记录']];
+  const tabs = [['users', '用户'], ['topups', '充值'], ['expenses', '消费'], ['audit', '日志']];
   const head = `${header('管理')}<div class="seg full" style="margin-bottom:14px">${tabs.map(([k, n]) =>
     `<button data-t="${k}" class="${k === tab ? 'on' : ''}">${n}${k === 'topups' && pending.length ? ` <span class="badge count">${pending.length}</span>` : ''}</button>`).join('')}</div>`;
   let body, mount;
   if (tab === 'users') [body, mount] = await adminUsers();
   else if (tab === 'topups') [body, mount] = await adminTopups();
+  else if (tab === 'audit') [body, mount] = await adminAudit();
   else [body, mount] = await adminExpenses();
   shell('admin', head + body, { pendingBadge: pending.length > 0 });
   $app.querySelectorAll('[data-t]').forEach((b) => b.onclick = () => { state.adminTab = b.dataset.t; renderAdmin().catch(fail); });
@@ -831,6 +854,25 @@ async function adminTopups() {
   return [html, mount];
 }
 
+async function adminAudit() {
+  const f = state.auditFilter || (state.auditFilter = { userId: '', others: true });
+  const q = new URLSearchParams();
+  if (f.userId) q.set('user_id', f.userId);
+  if (f.others) q.set('others', '1');
+  const [users, rows] = await Promise.all([api('GET', '/api/admin/users'), api('GET', '/api/admin/audit?' + q)]);
+  const html = `<div class="card">
+      <div class="field"><select id="au"><option value="">所有人</option>${users.map((u) => `<option value="${u.id}" ${String(u.id) === f.userId ? 'selected' : ''}>${esc(u.displayName)}</option>`).join('')}</select></div>
+      <label class="check"><input type="checkbox" id="ao" ${f.others ? 'checked' : ''}> 只看动了别人账户的操作</label>
+    </div>
+    <div class="section-title"><h3>最近 ${rows.length} 条</h3><span class="extra">日志不能修改或删除</span></div>
+    ${auditList(rows, { showTarget: true })}`;
+  const mount = () => {
+    document.getElementById('au').onchange = (e) => { f.userId = e.target.value; renderAdmin().catch(fail); };
+    document.getElementById('ao').onchange = (e) => { f.others = e.target.checked; renderAdmin().catch(fail); };
+  };
+  return [html, mount];
+}
+
 async function adminExpenses() {
   const f = state.adminFilter || (state.adminFilter = {});
   if (!f.from) f.from = addDays(me.today, -6);
@@ -881,6 +923,7 @@ async function route() {
     if (h === '/history') await renderHistory();
     else if (h === '/stats') await renderStats();
     else if (h === '/topup') await renderTopup();
+    else if (h === '/log') await renderMyLog();
     else if (h === '/me') renderMe();
     else if (h === '/admin' && me.user.isAdmin) await renderAdmin();
     else await renderHome();

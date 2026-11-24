@@ -449,3 +449,10 @@ nav.tabs a:active svg { transform: scale(.86); }
   *, *::before, *::after { animation-duration: .01ms !important; animation-delay: 0ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; }
   #loadbar::after { animation: none; left: 0; width: 100%; }
 }
+
+/* 余额卡 2x2 */
+.hero .row4 { display: grid; grid-template-columns: 1fr 1fr; gap: 10px 0; margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--hero-line); }
+.hero .row4 > div:nth-child(even) { padding-left: 14px; border-left: 1px solid var(--hero-line); }
+.hero .row4 .k { font-size: 12px; color: var(--hero-muted); }
+.hero .row4 .v { font-size: 16px; font-weight: 600; }
+.items li .name .badge { margin-left: 6px; }
