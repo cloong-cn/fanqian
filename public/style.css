@@ -484,3 +484,9 @@ nav.tabs a:active svg { transform: scale(.86); }
 .dbody .items li:first-child { border-top: 1px dashed var(--line); }
 .dlock { margin: 0 14px 10px 64px; }
 .day-row.open .dbody > div { padding-bottom: 4px; }
+
+/* 账单：明细 / 统计 切换 */
+.bill-body.swap > * { animation: rise .32s var(--ease-out) both; }
+.bill-body.swap > *:nth-child(2) { animation-delay: 30ms; }
+.bill-body.swap > *:nth-child(3) { animation-delay: 60ms; }
+.bill-body.swap > *:nth-child(n+4) { animation-delay: 90ms; }

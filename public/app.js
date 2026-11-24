@@ -125,6 +125,7 @@ document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeSheet
 const ICONS = {
   home: '<path d="M3.5 10.5 12 3.5l8.5 7V20a1 1 0 0 1-1 1H15v-6h-6v6H4.5a1 1 0 0 1-1-1z"/>',
   history: '<rect x="3.5" y="4.5" width="17" height="16" rx="3"/><path d="M3.5 9.5h17M8 2.5v4M16 2.5v4"/>',
+  bill: '<path d="M6 3h12v18l-3-2-3 2-3-2-3 2z"/><path d="M9 8h6M9 12h6M9 16h3"/>',
   stats: '<path d="M4 20V10M10 20V4M16 20v-7M21 20H3"/>',
   me: '<circle cx="12" cy="8" r="4"/><path d="M4 21c1.6-3.8 4.5-5.5 8-5.5s6.4 1.7 8 5.5"/>',
   admin: '<path d="M12 3l7.5 3v5.5c0 4.6-3.2 8.2-7.5 9.5-4.3-1.3-7.5-4.9-7.5-9.5V6z"/><path d="M9 12l2 2 4-4"/>',
@@ -150,7 +151,7 @@ const mealVar = (m) => `--m: var(--m-${m})`;
 const initial = (name) => esc([...String(name)][0] || '?');
 
 function shell(active, inner, { pendingBadge = false } = {}) {
-  const tabs = [['home', '记账', '#/'], ['history', '明细', '#/history'], ['stats', '统计', '#/stats'], ['me', '我的', '#/me']];
+  const tabs = [['home', '记账', '#/'], ['bill', '账单', '#/bill'], ['me', '我的', '#/me']];
   if (me.user.isAdmin) tabs.push(['admin', '管理', '#/admin']);
   const enter = enterNext; enterNext = false; enterNextWasSet = enter;
   $app.innerHTML = `<div class="wrap ${enter ? 'enter' : ''}">${inner}</div>
@@ -359,6 +360,45 @@ function itemLabel(x, prefix = '') {
 }
 const emptyState = (text) => `<div class="card empty-state">${icon('bowl')}${text}</div>`;
 
+// ---------- 账单（明细 + 统计） ----------
+const lsGet = (k) => { try { return localStorage.getItem(k); } catch { return null; } };
+const lsSet = (k, v) => { try { localStorage.setItem(k, v); } catch {} };
+let billSwap = false;   // 页内切换明细/统计时，只给内容区播放切换动画
+function billShell(tab, inner, exportArgs) {
+  shell('bill', `
+    ${header('账单', `<button class="btn soft sm" id="xbtn">${icon('excel')} 导出</button>`)}
+    <div class="seg full bill-seg" style="margin-bottom:14px">
+      <button data-bt="detail" class="${tab === 'detail' ? 'on' : ''}">明细</button>
+      <button data-bt="stats" class="${tab === 'stats' ? 'on' : ''}">统计</button>
+    </div>
+    <div class="bill-body ${billSwap ? 'swap' : ''}">${inner}</div>`);
+  billSwap = false;
+  document.getElementById('xbtn').onclick = () => exportSheet(exportArgs()).catch(fail);
+  $app.querySelectorAll('[data-bt]').forEach((b) => b.onclick = () => {
+    if (b.dataset.bt === state.billTab) return;
+    switchBill(b.dataset.bt).catch(fail);
+  });
+}
+// 明细 ↔ 统计 联动：两边看同一个月
+function monthToPeriod(month) {
+  const cur = me.today.slice(0, 7);
+  const d = new Date(cur + '-01T00:00:00Z'); d.setUTCMonth(d.getUTCMonth() - 1);
+  if (month === cur) return 'month';
+  if (month === d.toISOString().slice(0, 7)) return 'last';
+  return 'm:' + month;
+}
+async function switchBill(tab) {
+  if (tab === 'stats') state.statPeriod = monthToPeriod(state.month || me.today.slice(0, 7));
+  else state.month = periodRange(state.statPeriod)[1].slice(0, 7);   // 统计范围的最后一个月
+  state.billTab = tab; lsSet('cw.billTab', tab);
+  billSwap = true; hideTip(); resizeHook = null;
+  await (tab === 'stats' ? renderStats() : renderHistory());
+}
+async function renderBill() {
+  if (!state.billTab) state.billTab = lsGet('cw.billTab') === 'stats' ? 'stats' : 'detail';
+  await (state.billTab === 'stats' ? renderStats() : renderHistory());
+}
+
 const MEAL_SHORT = { breakfast: '早', lunch: '午', dinner: '晚', other: '其他' };
 // 紧凑明细：每天一行（早/午/晚分项 + 合计），点开看每一笔；周与周之间显示小计
 function compactDays(days) {
@@ -399,14 +439,14 @@ async function renderHistory() {
   const [y, m] = state.month.split('-').map(Number);
   const isCurrent = state.month >= me.today.slice(0, 7);
   const avg = h.days.length ? Math.round(h.totalCents / h.days.length) : 0;
-  shell('history', `
-    ${header('明细')}
+  const monthEnd = (() => { const d = new Date(Date.UTC(y, m, 0)); const e = d.toISOString().slice(0, 10); return e > me.today ? me.today : e; })();
+  billShell('detail', `
     <div class="monthbar">
       <button class="icon-btn" id="prev" aria-label="上个月">${icon('left')}</button>
       <div class="mid"><div class="m small muted">${y}年${m}月 · 记账 ${h.days.length} 天${h.days.length ? ' · 平均每天 ' + yuan(avg) : ''}</div><div class="v num">${yuan(h.totalCents)}</div></div>
       <button class="icon-btn" id="next" aria-label="下个月" ${isCurrent ? 'disabled' : ''}>${icon('chev')}</button>
     </div>
-    ${h.days.length ? compactDays(h.days) : emptyState('这个月还没有记录')}`);
+    ${h.days.length ? compactDays(h.days) : emptyState('这个月还没有记录')}`, () => ({ from: state.month + '-01', to: monthEnd }));
   const shift = (n) => { const d = new Date(Date.UTC(y, m - 1 + n, 1)); state.month = d.toISOString().slice(0, 7); renderHistory().catch(fail); };
   document.getElementById('prev').onclick = () => shift(-1);
   document.getElementById('next').onclick = () => shift(1);
@@ -497,6 +537,12 @@ function hbars(rows) {
 // ---------- 统计 ----------
 function periodRange(p) {
   const t = me.today;
+  if (p && p.startsWith('m:')) {
+    const mo = p.slice(2), [yy, mm] = mo.split('-').map(Number);
+    let end = new Date(Date.UTC(yy, mm, 0)).toISOString().slice(0, 10);
+    if (end > t) end = t;
+    return [mo + '-01', end, `${yy === Number(t.slice(0, 4)) ? '' : yy + '年'}${mm}月`];
+  }
   if (p === 'week') return [addDays(t, -dow(t)), t, '本周'];
   if (p === 'month') return [t.slice(0, 8) + '01', t, '本月'];
   if (p === 'last') {
@@ -527,6 +573,8 @@ async function renderStats() {
   statUsers = users;
   const all = scope === 'all';
   const periods = [['week', '本周'], ['month', '本月'], ['last', '上月'], ['30', '近30天'], ['90', '近90天'], ['year', '今年']];
+  // 从明细带过来的某个具体月份，作为一个额外的选项放在最前面
+  if (state.statPeriod.startsWith('m:')) periods.unshift([state.statPeriod, pname]);
 
   // 增减
   let delta = '<div class="delta">上期无记录</div>';
@@ -560,10 +608,10 @@ async function renderStats() {
       ${users.filter((u) => u.id !== me.user.id).map((u) => `<option value="${u.id}" ${String(u.id) === scope ? 'selected' : ''}>${esc(u.displayName)}</option>`).join('')}
     </select></div>` : '';
 
-  shell('stats', `
-    ${header('统计', `<button class="btn soft sm" id="xbtn">${icon('excel')} 导出</button><div style="margin-top:4px">${md(from)} – ${md(to)}</div>`)}
+  billShell('stats', `
     ${userOpts}
-    <div class="scroll-row" style="margin-bottom:14px"><div class="seg">${periods.map(([k, n]) => `<button data-p="${k}" class="${k === state.statPeriod ? 'on' : ''}">${n}</button>`).join('')}</div></div>
+    <div class="scroll-row" style="margin-bottom:6px"><div class="seg">${periods.map(([k, n]) => `<button data-p="${k}" class="${k === state.statPeriod ? 'on' : ''}">${n}</button>`).join('')}</div></div>
+    <div class="small muted" style="margin:0 2px 12px">${md(from)} – ${md(to)}</div>
     <div class="tiles">
       <div class="tile"><div class="k">${pname}花费</div><div class="v num">${countSpan(a.totalCents, 'st-total-' + scope)}</div>${delta}</div>
       <div class="tile"><div class="k">日均</div><div class="v num">${countSpan(a.avgPerDayCents, 'st-avg-' + scope)}</div><div class="delta">共 ${a.days} 天</div></div>
@@ -580,7 +628,7 @@ async function renderStats() {
     <div class="card anim"><h3>花钱最多的</h3><div class="sub">${pname}按总金额排名</div>
       ${a.topItems.length ? hbars(a.topItems.map((t) => ({ name: t.item, value: t.cents, meta: `${t.n} 次`, tip: `<b>${esc(t.item)}</b><br>${t.n} 次 · 共 ${yuan(t.cents)} · 平均 ${yuan(Math.round(t.cents / t.n))}` }))) : '<div class="muted small">暂无数据</div>'}</div>
     <div class="card"><h3>近 12 个月</h3><div class="sub">每月总花费</div>
-      <div class="chart-box" data-tipbox data-chart="months"></div></div>`);
+      <div class="chart-box" data-tipbox data-chart="months"></div></div>`, () => ({ from, to, scope }));
 
   const draw = (anim = false) => {
     const boxes = Object.fromEntries([...$app.querySelectorAll('[data-chart]')].map((b) => [b.dataset.chart, b]));
@@ -594,7 +642,6 @@ async function renderStats() {
   bindTips($app);
   resizeHook = draw;
   $app.querySelectorAll('[data-p]').forEach((b) => b.onclick = () => { state.statPeriod = b.dataset.p; renderStats().catch(fail); });
-  document.getElementById('xbtn').onclick = () => exportSheet({ from, to, scope }).catch(fail);
   const sc = document.getElementById('scope');
   if (sc) sc.onchange = () => { state.statScope = sc.value; renderStats().catch(fail); };
 }
@@ -961,8 +1008,8 @@ async function route() {
   closeSheet(); hideTip(); resizeHook = null; enterNext = true;
   const h = location.hash.replace(/^#/, '') || '/';
   try {
-    if (h === '/history') await renderHistory();
-    else if (h === '/stats') await renderStats();
+    if (h === '/bill') await renderBill();
+    else if (h === '/history' || h === '/stats') { state.billTab = h === '/stats' ? 'stats' : 'detail'; lsSet('cw.billTab', state.billTab); await renderBill(); }
     else if (h === '/topup') await renderTopup();
     else if (h === '/log') await renderMyLog();
     else if (h === '/me') renderMe();
