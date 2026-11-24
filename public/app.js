@@ -359,23 +359,64 @@ function itemLabel(x, prefix = '') {
 }
 const emptyState = (text) => `<div class="card empty-state">${icon('bowl')}${text}</div>`;
 
+const MEAL_SHORT = { breakfast: '早', lunch: '午', dinner: '晚', other: '其他' };
+// 紧凑明细：每天一行（早/午/晚分项 + 合计），点开看每一笔；周与周之间显示小计
+function compactDays(days) {
+  const weekStart = (d) => addDays(d, -dow(d));
+  const weekSum = new Map();
+  for (const d of days) weekSum.set(weekStart(d.day), (weekSum.get(weekStart(d.day)) || 0) + d.cents);
+  let lastWeek = null, html = '';
+  for (const d of days) {
+    const ws = weekStart(d.day);
+    if (ws !== lastWeek) {
+      if (lastWeek) html += '</ul></div>';
+      const we = addDays(ws, 6);
+      html += `<div class="week-head"><span>${md(ws)} – ${md(we)}</span><span class="num">${yuan(weekSum.get(ws))}</span></div><div class="card flush"><ul class="days">`;
+      lastWeek = ws;
+    }
+    const sums = MEALS.map((m) => ({ m: m.key, c: d.items.filter((x) => x.meal === m.key).reduce((a, x) => a + x.cents, 0) })).filter((x) => x.c);
+    const open = state.openDays.has(d.day);
+    const edited = d.items.some((x) => x.adminEdited);
+    html += `<li class="day-row ${open ? 'open' : ''}" data-day="${d.day}">
+      <button class="dsum" aria-expanded="${open}">
+        <span class="dnum"><b class="num">${Number(d.day.slice(8))}</b><small>${relDay(d.day)}</small></span>
+        <span class="dmeals">${sums.map((x) => `<span class="ms" style="${mealVar(x.m)}"><i class="mdot"></i>${MEAL_SHORT[x.m]} <span class="num">${money(x.c)}</span></span>`).join('')}${edited ? '<span class="badge wait">改过</span>' : ''}</span>
+        <span class="dtot num">${yuan(d.cents)}</span>
+        ${icon('chev', 'dchev')}
+      </button>
+      <div class="dbody"><div><ul class="items">${d.items.map((x) => `<li data-id="${x.id}" class="${d.editable ? '' : 'ro'}" style="${mealVar(x.meal)}">
+        <span class="mdot"></span><span class="tag">${MEAL_NAME[x.meal]}</span>${itemLabel(x)}<span class="amt num">${yuan(x.cents)}</span></li>`).join('')}</ul>
+        ${d.editable ? '' : '<div class="small muted dlock">已锁定，修改请联系管理员</div>'}</div></div>
+    </li>`;
+  }
+  return html + (lastWeek ? '</ul></div>' : '');
+}
+
 async function renderHistory() {
   if (!state.month) state.month = me.today.slice(0, 7);
+  if (!state.openDays) state.openDays = new Set();
   const h = await api('GET', '/api/history?month=' + state.month);
   const [y, m] = state.month.split('-').map(Number);
   const isCurrent = state.month >= me.today.slice(0, 7);
+  const avg = h.days.length ? Math.round(h.totalCents / h.days.length) : 0;
   shell('history', `
     ${header('明细')}
     <div class="monthbar">
       <button class="icon-btn" id="prev" aria-label="上个月">${icon('left')}</button>
-      <div class="mid"><div class="m small muted">${y}年${m}月 · 共 ${h.days.length} 天</div><div class="v num">${yuan(h.totalCents)}</div></div>
+      <div class="mid"><div class="m small muted">${y}年${m}月 · 记账 ${h.days.length} 天${h.days.length ? ' · 平均每天 ' + yuan(avg) : ''}</div><div class="v num">${yuan(h.totalCents)}</div></div>
       <button class="icon-btn" id="next" aria-label="下个月" ${isCurrent ? 'disabled' : ''}>${icon('chev')}</button>
     </div>
-    ${h.days.length ? dayCards(h.days, { editable: true }) : emptyState('这个月还没有记录')}`);
+    ${h.days.length ? compactDays(h.days) : emptyState('这个月还没有记录')}`);
   const shift = (n) => { const d = new Date(Date.UTC(y, m - 1 + n, 1)); state.month = d.toISOString().slice(0, 7); renderHistory().catch(fail); };
   document.getElementById('prev').onclick = () => shift(-1);
   document.getElementById('next').onclick = () => shift(1);
-  $app.querySelectorAll('li[data-id]:not(.ro)').forEach((li) => li.onclick = () => {
+  $app.querySelectorAll('.day-row .dsum').forEach((b) => b.onclick = () => {
+    const row = b.closest('.day-row'), day = row.dataset.day;
+    const open = !row.classList.contains('open');
+    row.classList.toggle('open', open); b.setAttribute('aria-expanded', open);
+    if (open) state.openDays.add(day); else state.openDays.delete(day);
+  });
+  $app.querySelectorAll('.day-row li[data-id]:not(.ro)').forEach((li) => li.onclick = () => {
     editExpense(h.days.flatMap((d) => d.items).find((i) => i.id === Number(li.dataset.id)), () => renderHistory());
   });
 }

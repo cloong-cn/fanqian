@@ -456,3 +456,31 @@ nav.tabs a:active svg { transform: scale(.86); }
 .hero .row4 .k { font-size: 12px; color: var(--hero-muted); }
 .hero .row4 .v { font-size: 16px; font-weight: 600; }
 .items li .name .badge { margin-left: 6px; }
+
+/* ========== 紧凑明细 ========== */
+.week-head { display: flex; justify-content: space-between; font-size: 12.5px; color: var(--muted); margin: 16px 4px 6px; }
+.week-head:first-of-type { margin-top: 4px; }
+.days { list-style: none; margin: 0; padding: 0; }
+.day-row + .day-row { border-top: 1px solid var(--line); }
+.dsum {
+  width: 100%; border: 0; background: transparent; cursor: pointer; text-align: left;
+  display: flex; align-items: center; gap: 12px; padding: 11px 14px 11px 12px; min-height: 58px;
+}
+.dsum:active { background: var(--soft); }
+.dnum { width: 40px; flex: none; display: flex; flex-direction: column; align-items: center; line-height: 1.15; }
+.dnum b { font-size: 19px; font-weight: 700; }
+.dnum small { font-size: 11px; color: var(--muted); }
+.dmeals { flex: 1; min-width: 0; display: flex; flex-wrap: wrap; gap: 4px 12px; font-size: 13.5px; color: var(--muted); }
+.ms { display: inline-flex; align-items: center; gap: 5px; white-space: nowrap; }
+.ms .num { color: var(--text); }
+.ms .mdot { width: 6px; height: 6px; }
+.dtot { font-weight: 700; font-size: 16px; flex: none; }
+.dchev { width: 16px; height: 16px; color: var(--faint); flex: none; transition: transform .25s var(--ease-out); }
+.day-row.open .dchev { transform: rotate(90deg); }
+.dbody { display: grid; grid-template-rows: 0fr; transition: grid-template-rows .28s var(--ease-out); }
+.dbody > div { overflow: hidden; }
+.day-row.open .dbody { grid-template-rows: 1fr; }
+.dbody .items { margin: 0 14px 0 64px; }
+.dbody .items li:first-child { border-top: 1px dashed var(--line); }
+.dlock { margin: 0 14px 10px 64px; }
+.day-row.open .dbody > div { padding-bottom: 4px; }
