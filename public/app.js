@@ -251,6 +251,10 @@ async function renderHome() {
       </div>
       <div class="total"><div class="k">${md(state.day)}合计</div><div class="v num">${countSpan(total, 'day-' + state.day)}</div></div>
     </div>
+    ${editable && !suggest.length && !dayData.items.length && !lsGet('cw.hintDone') ? `<div class="hint">
+      <div class="meal-icon" style="--m: var(--accent)">${icon('plus')}</div>
+      <div><b>怎么记账</b><div class="small">吃完饭点一下对应的餐次，输入花了多少钱就行。记下后会自动从你的余额里扣。</div></div>
+      <button class="hint-x" id="hint-x" aria-label="知道了">知道了</button></div>` : ''}
     ${mealsHtml}
     ${editable ? `<button class="btn soft block" data-add="other" style="margin-top:2px">${icon('plus')} 其他（零食、饮料…）</button>`
       : `<div class="locked">${icon('lock')}这一天已锁定，如需修改请联系管理员</div>`}`);
@@ -264,7 +268,14 @@ async function renderHome() {
     s.querySelector('#c').onclick = closeSheet;
     s.querySelector('#o').onclick = () => { const v = s.querySelector('#pd').value; if (v) { state.day = v; closeSheet(); renderHome().catch(fail); } };
   }, false);
-  $app.querySelectorAll('[data-add]').forEach((b) => b.onclick = () => addSheet(b.dataset.add, suggest));
+  $app.querySelectorAll('[data-add]').forEach((b) => b.onclick = (e) => { e.stopPropagation(); addSheet(b.dataset.add, suggest); });
+  // 点餐次卡片的空白处（不是某一笔记录）也能记
+  if (editable) $app.querySelectorAll('section.meal').forEach((sec) => sec.onclick = (e) => {
+    if (e.target.closest('li[data-id]')) return;
+    addSheet(sec.dataset.meal, suggest);
+  });
+  const dh = document.getElementById('hint-x');
+  if (dh) dh.onclick = () => { lsSet('cw.hintDone', '1'); dh.closest('.hint').remove(); };
   if (editable) $app.querySelectorAll('li[data-id]').forEach((li) => li.onclick = () => {
     editExpense(dayData.items.find((i) => i.id === Number(li.dataset.id)), () => renderHome());
   });
@@ -306,7 +317,7 @@ function addSheet(meal, suggest) {
 async function submitExpense(meal, item, amount) {
   try {
     const r = await api('POST', '/api/expenses', { day: state.day, meal, item, amount: String(amount).trim() });
-    closeSheet(); suggestCache = null; lastAddedId = r.id;
+    closeSheet(); suggestCache = null; lastAddedId = r.id; lsSet('cw.hintDone', '1');
     if (navigator.vibrate) navigator.vibrate(10);
     await refreshMe(); await renderHome(); lastAddedId = null;
     toast(`已记下 ${item || MEAL_NAME[meal]} ${yuan(r.cents)}`);
@@ -341,18 +352,6 @@ function editExpense(x, after) {
 }
 
 // ---------- 明细 ----------
-function dayCards(days, { editable, who } = {}) {
-  return days.map((d) => `<section class="card day-card">
-    <div class="dh"><span class="d">${md(d.day)}<span class="w">${relDay(d.day)}</span></span><span class="v num">${yuan(d.cents)}</span></div>
-    <ul class="items">${d.items.map((x) => {
-      const ro = !(editable && (d.editable ?? true));
-      return `<li data-id="${x.id}" class="${ro ? 'ro' : ''}" style="${mealVar(x.meal)}">
-        <span class="mdot"></span><span class="tag">${MEAL_NAME[x.meal]}</span>
-        ${itemLabel(x, who && x.displayName ? `<span class="muted">${esc(x.displayName)} · </span>` : '')}
-        <span class="amt num">${yuan(x.cents)}</span></li>`;
-    }).join('')}</ul>
-  </section>`).join('');
-}
 // 记录名：有内容显示内容，没有就显示记账时间；管理员改过的加标记
 function itemLabel(x, prefix = '') {
   const main = x.item ? esc(x.item) : `<span class="muted">${x.time ? x.time + ' 记' : '一笔'}</span>`;
@@ -400,8 +399,38 @@ async function renderBill() {
 }
 
 const MEAL_SHORT = { breakfast: '早', lunch: '午', dinner: '晚', other: '其他' };
-// 紧凑明细：每天一行（早/午/晚分项 + 合计），点开看每一笔；周与周之间显示小计
-function compactDays(days) {
+// 紧凑行：左边一块（日期或人名）+ 各餐小计 + 合计，点开看每一笔
+function compactRow(key, left, items, editable, openSet) {
+  const sums = MEALS.map((m) => ({ m: m.key, c: items.filter((x) => x.meal === m.key).reduce((a, x) => a + x.cents, 0) })).filter((x) => x.c);
+  const total = items.reduce((a, x) => a + x.cents, 0);
+  const open = openSet.has(key);
+  const edited = items.some((x) => x.adminEdited);
+  return `<li class="day-row ${open ? 'open' : ''}" data-key="${esc(key)}">
+    <button class="dsum" aria-expanded="${open}">
+      ${left}
+      <span class="dmeals">${sums.map((x) => `<span class="ms" style="${mealVar(x.m)}"><i class="mdot"></i>${MEAL_SHORT[x.m]} <span class="num"><span class="cy">¥</span>${money(x.c, { cur: false })}</span></span>`).join('')}${edited ? '<span class="badge wait">改过</span>' : ''}</span>
+      <span class="dtot num">${yuan(total)}</span>
+      ${icon('chev', 'dchev')}
+    </button>
+    <div class="dbody"><div><ul class="items">${items.map((x) => `<li data-id="${x.id}" class="${editable ? '' : 'ro'}" style="${mealVar(x.meal)}">
+      <span class="mdot"></span><span class="tag">${MEAL_NAME[x.meal]}</span>${itemLabel(x)}<span class="amt num">${yuan(x.cents)}</span></li>`).join('')}</ul>
+      ${editable ? '' : '<div class="small muted dlock">已锁定，修改请联系管理员</div>'}</div></div>
+  </li>`;
+}
+function bindCompact(openSet, allItems, onEdit) {
+  $app.querySelectorAll('.day-row .dsum').forEach((b) => b.onclick = () => {
+    const row = b.closest('.day-row'), key = row.dataset.key;
+    const open = !row.classList.contains('open');
+    row.classList.toggle('open', open); b.setAttribute('aria-expanded', open);
+    if (open) openSet.add(key); else openSet.delete(key);
+  });
+  $app.querySelectorAll('.day-row li[data-id]:not(.ro)').forEach((li) => li.onclick = () => {
+    editExpense(allItems.find((i) => i.id === Number(li.dataset.id)), onEdit);
+  });
+}
+const dateLeft = (day) => `<span class="dnum"><b class="num">${Number(day.slice(8))}</b><small>${relDay(day)}</small></span>`;
+// 按周分组，每天一行
+function compactDays(days, openSet) {
   const weekStart = (d) => addDays(d, -dow(d));
   const weekSum = new Map();
   for (const d of days) weekSum.set(weekStart(d.day), (weekSum.get(weekStart(d.day)) || 0) + d.cents);
@@ -410,26 +439,22 @@ function compactDays(days) {
     const ws = weekStart(d.day);
     if (ws !== lastWeek) {
       if (lastWeek) html += '</ul></div>';
-      const we = addDays(ws, 6);
-      html += `<div class="week-head"><span>${md(ws)} – ${md(we)}</span><span class="num">${yuan(weekSum.get(ws))}</span></div><div class="card flush"><ul class="days">`;
+      html += `<div class="week-head"><span>${md(ws)} – ${md(addDays(ws, 6))}</span><span class="num">${yuan(weekSum.get(ws))}</span></div><div class="card flush"><ul class="days">`;
       lastWeek = ws;
     }
-    const sums = MEALS.map((m) => ({ m: m.key, c: d.items.filter((x) => x.meal === m.key).reduce((a, x) => a + x.cents, 0) })).filter((x) => x.c);
-    const open = state.openDays.has(d.day);
-    const edited = d.items.some((x) => x.adminEdited);
-    html += `<li class="day-row ${open ? 'open' : ''}" data-day="${d.day}">
-      <button class="dsum" aria-expanded="${open}">
-        <span class="dnum"><b class="num">${Number(d.day.slice(8))}</b><small>${relDay(d.day)}</small></span>
-        <span class="dmeals">${sums.map((x) => `<span class="ms" style="${mealVar(x.m)}"><i class="mdot"></i>${MEAL_SHORT[x.m]} <span class="num">${money(x.c)}</span></span>`).join('')}${edited ? '<span class="badge wait">改过</span>' : ''}</span>
-        <span class="dtot num">${yuan(d.cents)}</span>
-        ${icon('chev', 'dchev')}
-      </button>
-      <div class="dbody"><div><ul class="items">${d.items.map((x) => `<li data-id="${x.id}" class="${d.editable ? '' : 'ro'}" style="${mealVar(x.meal)}">
-        <span class="mdot"></span><span class="tag">${MEAL_NAME[x.meal]}</span>${itemLabel(x)}<span class="amt num">${yuan(x.cents)}</span></li>`).join('')}</ul>
-        ${d.editable ? '' : '<div class="small muted dlock">已锁定，修改请联系管理员</div>'}</div></div>
-    </li>`;
+    html += compactRow(d.day, dateLeft(d.day), d.items, d.editable, openSet);
   }
   return html + (lastWeek ? '</ul></div>' : '');
+}
+// 管理员看所有人：按天分组，每人一行
+function compactPeople(days, openSet) {
+  return days.map((d) => {
+    const people = new Map();
+    for (const x of d.items) { if (!people.has(x.userId)) people.set(x.userId, { name: x.displayName, items: [] }); people.get(x.userId).items.push(x); }
+    return `<div class="week-head"><span>${md(d.day)} ${relDay(d.day)}</span><span class="num">${yuan(d.cents)}</span></div>
+      <div class="card flush"><ul class="days">${[...people].map(([uid, p]) =>
+        compactRow(`${d.day}|${uid}`, `<span class="dperson"><span class="avatar">${initial(p.name)}</span><span class="pn">${esc(p.name)}</span></span>`, p.items, true, openSet)).join('')}</ul></div>`;
+  }).join('');
 }
 
 async function renderHistory() {
@@ -443,22 +468,14 @@ async function renderHistory() {
   billShell('detail', `
     <div class="monthbar">
       <button class="icon-btn" id="prev" aria-label="上个月">${icon('left')}</button>
-      <div class="mid"><div class="m small muted">${y}年${m}月 · 记账 ${h.days.length} 天${h.days.length ? ' · 平均每天 ' + yuan(avg) : ''}</div><div class="v num">${yuan(h.totalCents)}</div></div>
+      <div class="mid"><div class="m small muted">${y}年${m}月 · 记账 ${h.days.length} 天</div><div class="v num">${yuan(h.totalCents)}</div>${h.days.length ? `<div class="small muted">平均每天 ${yuan(avg)}</div>` : ''}</div>
       <button class="icon-btn" id="next" aria-label="下个月" ${isCurrent ? 'disabled' : ''}>${icon('chev')}</button>
     </div>
-    ${h.days.length ? compactDays(h.days) : emptyState('这个月还没有记录')}`, () => ({ from: state.month + '-01', to: monthEnd }));
+    ${h.days.length ? compactDays(h.days, state.openDays) : emptyState('这个月还没有记录')}`, () => ({ from: state.month + '-01', to: monthEnd }));
   const shift = (n) => { const d = new Date(Date.UTC(y, m - 1 + n, 1)); state.month = d.toISOString().slice(0, 7); renderHistory().catch(fail); };
   document.getElementById('prev').onclick = () => shift(-1);
   document.getElementById('next').onclick = () => shift(1);
-  $app.querySelectorAll('.day-row .dsum').forEach((b) => b.onclick = () => {
-    const row = b.closest('.day-row'), day = row.dataset.day;
-    const open = !row.classList.contains('open');
-    row.classList.toggle('open', open); b.setAttribute('aria-expanded', open);
-    if (open) state.openDays.add(day); else state.openDays.delete(day);
-  });
-  $app.querySelectorAll('.day-row li[data-id]:not(.ro)').forEach((li) => li.onclick = () => {
-    editExpense(h.days.flatMap((d) => d.items).find((i) => i.id === Number(li.dataset.id)), () => renderHistory());
-  });
+  bindCompact(state.openDays, h.days.flatMap((d) => d.items), () => renderHistory());
 }
 
 // ---------- 图表 ----------
@@ -625,8 +642,8 @@ async function renderStats() {
     <div class="card anim"><h3>早中晚分布</h3><div class="sub">${pname}各餐次花费占比</div>${mealsHtml}</div>
     <div class="card"><h3>星期规律</h3><div class="sub">每个星期几平均花多少</div>
       <div class="chart-box" data-tipbox data-chart="week"></div></div>
-    <div class="card anim"><h3>花钱最多的</h3><div class="sub">${pname}按总金额排名</div>
-      ${a.topItems.length ? hbars(a.topItems.map((t) => ({ name: t.item, value: t.cents, meta: `${t.n} 次`, tip: `<b>${esc(t.item)}</b><br>${t.n} 次 · 共 ${yuan(t.cents)} · 平均 ${yuan(Math.round(t.cents / t.n))}` }))) : '<div class="muted small">暂无数据</div>'}</div>
+    ${a.topItems.length ? `<div class="card anim"><h3>花钱最多的</h3><div class="sub">${pname}按总金额排名</div>
+      ${hbars(a.topItems.map((t) => ({ name: t.item, value: t.cents, meta: `${t.n} 次`, tip: `<b>${esc(t.item)}</b><br>${t.n} 次 · 共 ${yuan(t.cents)} · 平均 ${yuan(Math.round(t.cents / t.n))}` })))}</div>` : ''}
     <div class="card"><h3>近 12 个月</h3><div class="sub">每月总花费</div>
       <div class="chart-box" data-tipbox data-chart="months"></div></div>`, () => ({ from, to, scope }));
 
@@ -673,7 +690,7 @@ async function exportSheet({ from, to, scope = '' } = {}) {
       <option value="">我自己</option><option value="all" ${scope === 'all' ? 'selected' : ''}>所有人</option>
       ${users.filter((u) => u.id !== me.user.id).map((u) => `<option value="${u.id}" ${String(u.id) === scope ? 'selected' : ''}>${esc(u.displayName)}</option>`).join('')}
     </select></div>` : ''}
-    <div class="field"><label>时间范围</label><div style="display:flex;gap:8px"><input type="date" id="xf" value="${from}" max="${me.today}"><input type="date" id="xt" value="${to}" max="${me.today}"></div></div>
+    <div class="field"><label>时间范围</label><div class="date-row"><input type="date" id="xf" value="${from}" max="${me.today}"><input type="date" id="xt" value="${to}" max="${me.today}"></div></div>
     <div class="chips" style="margin:-4px 0 14px">${quick.map(([k, n]) => `<button type="button" class="chip" data-q="${k}">${n}</button>`).join('')}</div>
     <p class="small muted" style="margin:0">表格里有：消费明细、每日汇总（按早中晚分列）${me.user.isAdmin ? '、每人汇总' : ''}、充值记录。</p>
     <div class="btns"><button class="btn soft" id="c">取消</button><button class="btn" id="o">${icon('excel')} 下载</button></div>`, (s) => {
@@ -963,6 +980,7 @@ async function adminAudit() {
 
 async function adminExpenses() {
   const f = state.adminFilter || (state.adminFilter = {});
+  if (!state.adminOpen) state.adminOpen = new Set();
   if (!f.from) f.from = addDays(me.today, -6);
   if (!f.to) f.to = me.today;
   const q = new URLSearchParams({ from: f.from, to: f.to });
@@ -979,11 +997,11 @@ async function adminExpenses() {
   const html = `
     <div class="card">
       <div class="field"><select id="fu"><option value="">所有人</option>${users.map((u) => `<option value="${u.id}" ${String(u.id) === f.userId ? 'selected' : ''}>${esc(u.displayName)}</option>`).join('')}</select></div>
-      <div style="display:flex;gap:8px;margin-bottom:10px"><input type="date" id="ff" value="${f.from}" max="${me.today}"><input type="date" id="ft" value="${f.to}" max="${me.today}"></div>
+      <div class="date-row" style="margin-bottom:10px"><input type="date" id="ff" value="${f.from}" max="${me.today}"><input type="date" id="ft" value="${f.to}" max="${me.today}"></div>
       <div class="chips">${quick.map(([k, n]) => `<button class="chip" data-r="${k}">${n}</button>`).join('')}<button class="chip" id="xadm" style="margin-left:auto">${icon('excel')} 导出</button></div>
     </div>
-    <div class="section-title"><h3>合计 <span class="num">${yuan(total)}</span></h3><span class="extra">${rows.length} 笔 · 点一笔可修改</span></div>
-    ${days.length ? dayCards(days, { editable: true, who: !f.userId }) : emptyState('这段时间没有记录')}`;
+    <div class="section-title"><h3>合计 <span class="num">${yuan(total)}</span></h3><span class="extra">${rows.length} 笔 · 点开可修改</span></div>
+    ${!days.length ? emptyState('这段时间没有记录') : f.userId ? compactDays(days, state.adminOpen) : compactPeople(days, state.adminOpen)}`;
   const mount = () => {
     const reload = () => renderAdmin().catch(fail);
     document.getElementById('xadm').onclick = () => exportSheet({ from: f.from, to: f.to, scope: f.userId || 'all' }).catch(fail);
@@ -995,9 +1013,7 @@ async function adminExpenses() {
       f.from = r === 'm' ? me.today.slice(0, 8) + '01' : addDays(me.today, -Number(r));
       reload();
     });
-    $app.querySelectorAll('li[data-id]').forEach((li) => li.onclick = () => {
-      editExpense(rows.find((r) => r.id === Number(li.dataset.id)), () => renderAdmin());
-    });
+    bindCompact(state.adminOpen, rows, () => renderAdmin());
   };
   return [html, mount];
 }
