@@ -76,9 +76,13 @@ function loading(on) {
   if (inflight <= 0) { inflight = 0; clearTimeout(loadTimer); loadTimer = null; $load.classList.remove('on'); }
 }
 
+const pending = new Set();
 async function api(method, url, body) {
+  const key = method === 'GET' ? null : method + ' ' + url + ' ' + JSON.stringify(body ?? {});
+  if (key && pending.has(key)) { const e = new Error('处理中'); e.silent = true; throw e; }
+  if (key) pending.add(key);
   loading(true);
-  try { return await apiRaw(method, url, body); } finally { loading(false); }
+  try { return await apiRaw(method, url, body); } finally { loading(false); if (key) pending.delete(key); }
 }
 async function apiRaw(method, url, body) {
   const opt = { method, headers: {} };
@@ -98,7 +102,7 @@ function toast(msg) {
   t.textContent = msg; t.classList.add('show');
   clearTimeout(toastTimer); toastTimer = setTimeout(() => t.classList.remove('show'), 2000);
 }
-const fail = (e) => toast(e.message || String(e));
+const fail = (e) => { if (!e || !e.silent) toast((e && e.message) || String(e)); };
 
 // ---------- 底部弹窗 ----------
 const $sheet = document.getElementById('sheet');

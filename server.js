@@ -105,10 +105,18 @@ async function currentUser(req) {
   if (!token || !/^[a-f0-9]{64}$/.test(token)) return null;
   const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
   const { rows } = await db.query(`
-    SELECT u.id, u.username, u.display_name, u.is_admin FROM sessions s
-    JOIN users u ON u.id = s.user_id
+    SELECT u.id, u.username, u.display_name, u.is_admin,
+           s.expires_at < now() + interval '${SESSION_DAYS - 1} days' AS stale
+    FROM sessions s JOIN users u ON u.id = s.user_id
     WHERE s.token=$1 AND s.expires_at > now() AND NOT u.disabled`, [tokenHash]);
-  return rows[0] || null;
+  const u = rows[0];
+  if (!u) return null;
+  // 滑动续期：每天第一次访问时把有效期重新推到 30 天后，经常用的人不会被登出
+  if (u.stale) {
+    await db.query(`UPDATE sessions SET expires_at = now() + $2::interval WHERE token=$1`, [tokenHash, `${SESSION_DAYS} days`]);
+    u.renewToken = token;
+  }
+  return u;
 }
 function sessionCookie(token, maxAge) {
   return `cw_session=${token}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=${maxAge}`;
@@ -282,7 +290,7 @@ route('DELETE', '/api/expenses/:id', async ({ user, params }) => {
 // 历史：按月，按天分组
 route('GET', '/api/history', async ({ user, query }) => {
   const month = query.get('month') || todayStr().slice(0, 7);
-  if (!MONTH_RE.test(month)) throw bad('月份不对');
+  if (!MONTH_RE.test(month) || !validDay(month + '-01')) throw bad('月份不对');
   const uid = targetUserId(user, query.get('user_id'));
   const from = month + '-01';
   const { rows } = await db.query(
@@ -749,6 +757,7 @@ const server = http.createServer(async (req, res) => {
     if (!r) throw new HttpError(404, '接口不存在');
     const m = url.pathname.match(r.re);
     const params = Object.fromEntries(r.keys.map((k, i) => [k, Number(m[i + 1])]));
+    if (Object.values(params).some((v) => !(v > 0 && v <= 2147483647))) throw new HttpError(404, '记录不存在');
     let body = {};
     if (req.method !== 'GET' && req.method !== 'DELETE') {
       // 只接受 JSON：跨站表单无法伪造这种请求（防 CSRF）。DELETE 跨站必须经过 CORS 预检，本身就伪造不了
@@ -761,6 +770,7 @@ const server = http.createServer(async (req, res) => {
     if (r.auth !== 'none') {
       user = await currentUser(req);
       if (!user) throw new HttpError(401, '请先登录');
+      if (user.renewToken) res.setHeader('Set-Cookie', sessionCookie(user.renewToken, SESSION_DAYS * 86400));
       if (r.auth === 'admin' && !user.is_admin) throw new HttpError(403, '需要管理员权限');
     }
     const result = await r.handler({ req, res, user, params, body, query: url.searchParams });

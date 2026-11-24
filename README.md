@@ -32,3 +32,6 @@
     sudo -u postgres dropdb cw && sudo -u postgres createdb -O cw cw
     zcat /srv/cw/backups/cw-YYYYMMDD-HHMM.sql.gz | sudo -u cw psql -q -d cw
     systemctl start cw
+
+## 测试
+改完代码后跑一遍：`sh tests/run.sh`（接口测试，用临时 zz* 账号，跑完自动清理；最后一行应是「失败 0 项」）
