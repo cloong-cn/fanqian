@@ -21,3 +21,14 @@
 
 ## 管理员命令
     cd /srv/cw/app && sudo -u cw node server.js create-admin <用户名> <显示名> [密码]
+
+## 备份与恢复
+备份只放在本机 `/srv/cw/backups`（每天 03:30，保留 60 天），服务器整体靠云厂商快照兜底。
+手动备份一次：`systemctl start cw-backup.service`
+
+从备份恢复（会覆盖当前数据，先停服务）：
+
+    systemctl stop cw
+    sudo -u postgres dropdb cw && sudo -u postgres createdb -O cw cw
+    zcat /srv/cw/backups/cw-YYYYMMDD-HHMM.sql.gz | sudo -u cw psql -q -d cw
+    systemctl start cw
