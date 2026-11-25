@@ -16,6 +16,11 @@ const LOW_BALANCE_CENTS = 5000;
 
 // 数据库：默认用本机 unix socket + peer 认证（无需密码）；也可用标准的 PGHOST/PGDATABASE/PGUSER/PGPASSWORD 环境变量
 const pool = new Pool({ host: process.env.PGHOST || '/var/run/postgresql', database: process.env.PGDATABASE || 'cw', max: 10 });
+// 空闲连接被数据库断开（PostgreSQL 重启、管理员踢连接）时 pg 会发 error 事件；不监听的话整个进程会崩溃。
+// 记下日志即可：坏掉的连接会被连接池丢弃，下一个请求自动新建连接
+pool.on('error', (e) => console.error('数据库空闲连接断开（已自动丢弃）:', e.message));
+// 兜底：万一哪里有没处理的 Promise 错误，只记日志不让进程退出（每个请求本身都有 try/catch 返回 500）
+process.on('unhandledRejection', (e) => console.error('未处理的异步错误:', e));
 // 每个写请求整体放在一个数据库事务里（见路由）：中途任何一步出错，这次请求的所有改动一起撤销，
 // 不会出现"记录改了、日志没写"之类的半截数据。db.query 在事务里自动走事务连接，在外面走连接池。
 const txStore = new AsyncLocalStorage();
