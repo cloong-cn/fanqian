@@ -92,7 +92,7 @@ ALTER TABLE users ADD COLUMN IF NOT EXISTS deleted_with_dept boolean NOT NULL DE
 ALTER TABLE departments ADD COLUMN IF NOT EXISTS deleted_at timestamptz;
 
 -- 合买（比如几个人一起买个西瓜）：发起人选人，被选的人同意/拒绝，全部表态完（或发起人提前结算）后
--- 按"同意的人数"平分，四舍五入到分，尾差由发起人补齐（发起人没参加则由最早同意的人补齐）。
+-- 按"同意的人数"平分到分，除不尽的几分钱随机分给几个人（每人最多多 1 分），见 server.js splitShares()。
 -- 结算时给每个同意的人各记一条 meal='other' 的消费，expenses.split_id 指回这里。
 -- status: open=进行中, settled=已结算, cancelled=已取消（含没人同意）
 CREATE TABLE IF NOT EXISTS splits (

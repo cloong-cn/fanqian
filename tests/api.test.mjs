@@ -448,24 +448,36 @@ sec('合买：发起 / 表态 / 自动结算 / 四舍五入 / 权限');
   ok((await A.put('/api/expenses/' + ex.id, { amount: '5' })).s === 200, 'admin can still correct split expense');
   ok((await S1.get('/api/audit/mine')).d.some((r) => r.action === 'split.charge'), 'charge shows in member\'s account log');
 
-  // 2) 10 元 3 人都同意：333 / 333 / 发起人 334
+  // 2) 10 元 3 人都同意：每人 333，多出的 1 分随机给一个人
   b = { u: await bal(U), s1: await bal(S1), s2: await bal(S2) };
   const c2 = (await U.post('/api/splits', { item: '葡萄', amount: '10', members: [uid, s1, s2] })).d.id;
   await S1.post(`/api/splits/${c2}/respond`, { agree: true }); await S2.post(`/api/splits/${c2}/respond`, { agree: true });
-  ok(await bal(S1) === b.s1 - 333 && await bal(S2) === b.s2 - 333 && await bal(U) === b.u - 334, 'rounded to cent, creator covers remainder');
+  let paid = [b.u - await bal(U), b.s1 - await bal(S1), b.s2 - await bal(S2)].sort();
+  ok(JSON.stringify(paid) === '[333,333,334]', 'split to cent, one random person pays the extra 1 cent', JSON.stringify(paid));
 
-  // 3) 发起人不参加：S1 发起 10 元给 U/S2/S3，尾差由最早同意的人补
+  // 3) 发起人不参加：S1 发起 10 元给 U/S2/S3，发起人不扣钱
   b = { u: await bal(U), s1: await bal(S1), s2: await bal(S2), s3: await bal(S3) };
   const c3 = (await S1.post('/api/splits', { item: '苹果', amount: '10', members: [uid, s2, s3] })).d.id;
   ok((await find(S1, c3)).myStatus === null, 'creator not a member when unchecked');
   await S2.post(`/api/splits/${c3}/respond`, { agree: true }); await U.post(`/api/splits/${c3}/respond`, { agree: true }); await S3.post(`/api/splits/${c3}/respond`, { agree: true });
-  ok(await bal(S1) === b.s1 && await bal(S2) === b.s2 - 334 && await bal(U) === b.u - 333 && await bal(S3) === b.s3 - 333, 'first agreer covers remainder when creator not in');
+  paid = [b.u - await bal(U), b.s2 - await bal(S2), b.s3 - await bal(S3)].sort();
+  ok(await bal(S1) === b.s1 && JSON.stringify(paid) === '[333,333,334]', 'creator not in: not charged, members 333/333/334');
 
-  // 4) 四舍五入：0.05 元 2 人 → 非补齐的人 round(2.5)=3 分，发起人 2 分
-  b = { u: await bal(U), s1: await bal(S1) };
-  const c4 = (await U.post('/api/splits', { item: '橘子', amount: '0.05', members: [uid, s1] })).d.id;
-  await S1.post(`/api/splits/${c4}/respond`, { agree: true });
-  ok(await bal(S1) === b.s1 - 3 && await bal(U) === b.u - 2, 'half rounds up (2.5 -> 3)');
+  // 4) 尾差随机：0.05 元 3 人（每人 1 分，剩 2 分随机给 2 个人）；0.04 元 3 人跑 60 次，每个人都应该分到过那 1 分
+  b = { u: await bal(U), s1: await bal(S1), s2: await bal(S2) };
+  const c4 = (await U.post('/api/splits', { item: '橘子', amount: '0.05', members: [uid, s1, s2] })).d.id;
+  await S1.post(`/api/splits/${c4}/respond`, { agree: true }); await S2.post(`/api/splits/${c4}/respond`, { agree: true });
+  paid = [b.u - await bal(U), b.s1 - await bal(S1), b.s2 - await bal(S2)].sort();
+  ok(JSON.stringify(paid) === '[1,2,2]', 'remainder of 2 cents goes to 2 different people', JSON.stringify(paid));
+  const hits = new Map([[uid, 0], [s1, 0], [s2, 0]]);
+  for (let k = 0; k < 60; k++) {
+    const id = (await U.post('/api/splits', { item: '瓜子', amount: '0.04', members: [uid, s1, s2] })).d.id;
+    await S1.post(`/api/splits/${id}/respond`, { agree: true }); await S2.post(`/api/splits/${id}/respond`, { agree: true });
+    const ms = (await find(U, id)).members;
+    for (const m of ms) if (m.cents === 2) hits.set(m.id, hits.get(m.id) + 1);
+    if (ms.reduce((a, m) => a + m.cents, 0) !== 4) { ok(false, 'sum equals total'); break; }
+  }
+  ok([...hits.values()].every((n) => n > 0) && [...hits.values()].reduce((a, n) => a + n, 0) === 60, 'extra cent is random across everyone', JSON.stringify([...hits]));
 
   // 5) 提前结算：没表态的人不扣
   b = { u: await bal(U), s1: await bal(S1), s2: await bal(S2) };

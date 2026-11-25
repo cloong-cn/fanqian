@@ -825,7 +825,7 @@ async function renderTopup() {
 }
 
 // ---------- 合买 ----------
-// 金额规则和服务端 splitShares() 一致：每人 round(总价/人数)，尾差由发起人（没参加则最早同意的人）补齐。这里只用来预览
+// 预览用：服务端 splitShares() 每人扣 floor 或 floor+1 分（多出的几分随机分给几个人），这里显示四舍五入的约数
 const perHead = (total, n) => (n ? Math.round(total / n) : 0);
 const SPLIT_MEMBER = { pending: ['未表态', 'wait'], agreed: ['同意', 'accent'], declined: ['拒绝', 'off'] };
 function splitCard(s) {
@@ -862,7 +862,7 @@ async function renderSplit() {
   const open = list.filter((s) => s.status === 'open'), done = list.filter((s) => s.status !== 'open');
   shell('home', `
     <header class="top"><div><a href="#/" class="small">‹ 记账</a><div class="title">合买</div></div></header>
-    <p class="small muted" style="margin:-6px 2px 12px">几个人一起买个西瓜、水果之类的：发起人选好一起分的人，被选的人同意或拒绝。所有人表态完自动按「同意的人数」平分扣款，四舍五入到分，尾差由发起人补齐；拒绝的人不扣钱。</p>
+    <p class="small muted" style="margin:-6px 2px 12px">几个人一起买个西瓜、水果之类的：发起人选好一起分的人，被选的人同意或拒绝。所有人表态完自动按「同意的人数」平分扣款，精确到分，除不尽的几分钱随机分给几个人（每人最多多 1 分）；拒绝的人不扣钱。</p>
     <button class="btn block" id="new">${icon('plus')} 发起合买</button>
     ${open.length ? `<div class="section-title"><h3>进行中</h3></div>${open.map(splitCard).join('')}` : ''}
     <div class="section-title"><h3>已结束</h3>${me.user.isAdmin ? '<span class="extra">管理员能看到本部门全部</span>' : ''}</div>

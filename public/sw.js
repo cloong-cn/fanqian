@@ -1,5 +1,5 @@
 // 只缓存页面外壳，用于断网时还能打开；数据接口 /api/ 一律走网络，绝不缓存
-const CACHE = 'cw-shell-v8';
+const CACHE = 'cw-shell-v9';
 const SHELL = ['/', '/app.js', '/style.css', '/manifest.json', '/icon.svg', '/icon-192.png'];
 self.addEventListener('install', (e) => {
   e.waitUntil(caches.open(CACHE).then((c) => c.addAll(SHELL)).then(() => self.skipWaiting()));

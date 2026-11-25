@@ -679,12 +679,14 @@ route('DELETE', '/api/topups/:id', async ({ user, params }) => {
 // ---------- 合买 ----------
 // 规则见 schema.sql 里 splits 表的注释。金额只在结算时一次性算好、记成消费，之后余额照常现算。
 const SPLIT_STATUS_CN = { open: '进行中', settled: '已结算', cancelled: '已取消' };
-// 平分：每人 round(总价/人数)，补齐的人出"总价 − 其他人之和"。人多钱少到补齐的人出不到 1 分时改用向下取整
-function splitShares(total, ids, payerId) {
-  const n = ids.length;
-  let base = Math.round(total / n);
-  if (total - base * (n - 1) <= 0) base = Math.floor(total / n);
-  return new Map(ids.map((id) => [id, id === payerId ? total - base * (n - 1) : base]));
+// 平分：每人先扣 floor(总价/人数)（精确到分），除不尽剩下的 r 分钱随机挑 r 个人各多扣 1 分。
+// 所以每人扣的钱最多差 1 分，合计正好等于总价
+function splitShares(total, ids) {
+  const n = ids.length, base = Math.floor(total / n), r = total - base * n;
+  const order = [...ids];
+  for (let i = order.length - 1; i > 0; i--) { const j = crypto.randomInt(i + 1); [order[i], order[j]] = [order[j], order[i]]; }
+  const extra = new Set(order.slice(0, r));
+  return new Map(ids.map((id) => [id, base + (extra.has(id) ? 1 : 0)]));
 }
 async function loadSplit(id, { lock = false } = {}) {
   const { rows: [s] } = await db.query(`SELECT id, dept_id, creator_id, item, total_cents, status,
@@ -703,15 +705,15 @@ async function settleSplit(s, actorId) {
     await audit(db, actorId, s.creator_id, 'split.cancel', `合买「${s.item}」${fmtY(s.total_cents)} 没有人同意，自动取消`);
     return;
   }
-  const payer = agreed.includes(s.creator_id) ? s.creator_id : agreed[0];
-  const shares = splitShares(s.total_cents, agreed, payer);
+  const shares = splitShares(s.total_cents, agreed);
+  const base = Math.floor(s.total_cents / agreed.length);
   const item = cleanText('合买·' + s.item, 40);
   for (const [uid, cents] of shares) {
     await db.query(`INSERT INTO expenses(user_id,day,meal,item,cents,split_id) VALUES($1,$2,'other',$3,$4,$5)`,
       [uid, s.day, item, cents, s.id]);
     await db.query(`UPDATE split_members SET cents=$3 WHERE split_id=$1 AND user_id=$2`, [s.id, uid, cents]);
     await audit(db, actorId, uid, 'split.charge',
-      `合买「${s.item}」共 ${fmtY(s.total_cents)}，${agreed.length} 人分摊，扣 ${fmtY(cents)}${uid === payer && agreed.length > 1 ? '（含补齐尾差）' : ''}`,
+      `合买「${s.item}」共 ${fmtY(s.total_cents)}，${agreed.length} 人分摊，扣 ${fmtY(cents)}${cents > base ? '（随机分到 1 分尾差）' : ''}`,
       { splitId: s.id, cents });
   }
   await db.query(`UPDATE splits SET status='settled', closed_at=now(), closed_by=$2 WHERE id=$1`, [s.id, actorId]);
