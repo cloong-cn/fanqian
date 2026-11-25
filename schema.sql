@@ -63,3 +63,18 @@ CREATE INDEX IF NOT EXISTS audit_target ON audit_log(target_user_id, id DESC);
 
 -- 被管理员改过的消费记录做个标记，用户自己能看到
 ALTER TABLE expenses ADD COLUMN IF NOT EXISTS admin_edited boolean NOT NULL DEFAULT false;
+
+-- 部门：每个部门的资金池、记录、统计互相独立
+CREATE TABLE IF NOT EXISTS departments (
+  id         serial PRIMARY KEY,
+  name       text NOT NULL UNIQUE,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+INSERT INTO departments(id, name) VALUES (1, '部门一') ON CONFLICT (id) DO NOTHING;
+SELECT setval(pg_get_serial_sequence('departments', 'id'), GREATEST((SELECT MAX(id) FROM departments), 1));
+ALTER TABLE users ADD COLUMN IF NOT EXISTS dept_id int NOT NULL DEFAULT 1 REFERENCES departments(id);
+-- 总管理员：管所有部门；is_admin 只管自己部门
+ALTER TABLE users ADD COLUMN IF NOT EXISTS is_super boolean NOT NULL DEFAULT false;
+-- 升级时：还没有总管理员的话，把现有管理员设为总管理员（保证系统里总有人能管部门）
+UPDATE users SET is_super = true WHERE is_admin AND NOT disabled AND NOT EXISTS (SELECT 1 FROM users WHERE is_super AND NOT disabled);
+CREATE INDEX IF NOT EXISTS users_dept ON users(dept_id);

@@ -87,9 +87,10 @@ const bad = (msg) => new HttpError(400, msg);
 // ---------- 余额 ----------
 async function balances(userId) {
   const { rows: [r] } = await db.query(`
+    WITH d AS (SELECT id FROM users WHERE dept_id = (SELECT dept_id FROM users WHERE id=$1))
     SELECT
-      (SELECT COALESCE(SUM(cents),0) FROM topups WHERE status='done')
-        - (SELECT COALESCE(SUM(cents),0) FROM expenses) AS pool,
+      (SELECT COALESCE(SUM(cents),0) FROM topups WHERE status='done' AND user_id IN (SELECT id FROM d))
+        - (SELECT COALESCE(SUM(cents),0) FROM expenses WHERE user_id IN (SELECT id FROM d)) AS pool,
       (SELECT COALESCE(SUM(cents),0) FROM topups WHERE status='done' AND user_id=$1)
         - (SELECT COALESCE(SUM(cents),0) FROM expenses WHERE user_id=$1) AS mine,
       (SELECT COALESCE(SUM(cents),0) FROM topups WHERE status='pending' AND user_id=$1) AS pending`, [userId]);
@@ -110,12 +111,13 @@ async function currentUser(req) {
   if (!token || !/^[a-f0-9]{64}$/.test(token)) return null;
   const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
   const { rows } = await db.query(`
-    SELECT u.id, u.username, u.display_name, u.is_admin,
+    SELECT u.id, u.username, u.display_name, u.is_admin, u.is_super, u.dept_id,
            s.expires_at < now() + interval '${SESSION_DAYS - 1} days' AS stale
     FROM sessions s JOIN users u ON u.id = s.user_id
     WHERE s.token=$1 AND s.expires_at > now() AND NOT u.disabled`, [tokenHash]);
   const u = rows[0];
   if (!u) return null;
+  u.is_admin = u.is_admin || u.is_super;   // 总管理员自然也是管理员
   // 滑动续期：每天第一次访问时把有效期重新推到 30 天后，经常用的人不会被登出
   if (u.stale) {
     await db.query(`UPDATE sessions SET expires_at = now() + $2::interval WHERE token=$1`, [tokenHash, `${SESSION_DAYS} days`]);
@@ -156,12 +158,32 @@ async function audit(q, actorId, targetUserId, action, detail, data = null) {
     [actorId, targetUserId, action, detail, data ? JSON.stringify(data) : null]);
 }
 
+// ---------- 部门范围 ----------
+// 管理员当前操作的部门：总管理员可以用 dept 参数切换，其他管理员固定为自己的部门
+async function adminDept(user, raw) {
+  if (raw !== undefined && raw !== null && raw !== '' && user.is_super) {
+    const id = Number(raw);
+    const { rows: [d] } = await db.query(`SELECT id FROM departments WHERE id=$1`, [Number.isInteger(id) && id > 0 && id < 2147483647 ? id : 0]);
+    if (!d) throw bad('部门不存在');
+    return d.id;
+  }
+  return user.dept_id;
+}
+// 目标用户必须在管理员能管的范围内（总管理员不限；部门管理员只能管本部门）
+async function userInScope(user, id, q = db) {
+  const n = Number(id);
+  if (!Number.isInteger(n) || n <= 0 || n > 2147483647) throw new HttpError(404, '用户不存在');
+  const { rows: [u] } = await q.query(`SELECT * FROM users WHERE id=$1`, [n]);
+  if (!u || (!user.is_super && u.dept_id !== user.dept_id)) throw new HttpError(404, '用户不存在');
+  return u;
+}
+
 // ---------- 路由 ----------
 const routes = [];
 function route(method, pattern, handler, opts = {}) {
   const keys = [];
   const re = new RegExp('^' + pattern.replace(/:(\w+)/g, (_, k) => { keys.push(k); return '(\\d+)'; }) + '$');
-  routes.push({ method, re, keys, handler, auth: opts.auth ?? 'user' });
+  routes.push({ method, re, keys, handler, auth: opts.auth ?? 'user' });   // auth: none | user | admin | super
 }
 
 // 登录核心：成功返回 token，失败抛 HttpError（401 密码不对 / 429 锁定）
@@ -228,10 +250,13 @@ route('POST', '/api/logout', async ({ req, res }) => {
 
 route('GET', '/api/me', async ({ user }) => {
   return {
-    user: { id: user.id, username: user.username, displayName: user.display_name, isAdmin: user.is_admin },
+    user: { id: user.id, username: user.username, displayName: user.display_name, isAdmin: user.is_admin, isSuper: user.is_super },
+    dept: (await db.query(`SELECT id, name FROM departments WHERE id=$1`, [user.dept_id])).rows[0],
+    deptCount: Number((await db.query(`SELECT COUNT(*) AS n FROM departments`)).rows[0].n),
     today: todayStr(),
     lowBalanceCents: LOW_BALANCE_CENTS,
-    todayAllCents: Number((await db.query(`SELECT COALESCE(SUM(cents),0) AS c FROM expenses WHERE day=$1`, [todayStr()])).rows[0].c),
+    todayAllCents: Number((await db.query(`SELECT COALESCE(SUM(e.cents),0) AS c FROM expenses e JOIN users u ON u.id=e.user_id
+      WHERE e.day=$1 AND u.dept_id=$2`, [todayStr(), user.dept_id])).rows[0].c),
     ...(await balances(user.id)),
   };
 });
@@ -250,19 +275,15 @@ route('POST', '/api/password', async ({ user, body }) => {
 route('GET', '/api/day', async ({ user, query }) => {
   const day = query.get('date') || todayStr();
   if (!validDay(day)) throw bad('日期不对');
-  const uid = targetUserId(user, query.get('user_id'));
+  const uid = await targetUserId(user, query.get('user_id'));
   const { rows } = await db.query(
     `SELECT ${EXP_COLS} FROM expenses
      WHERE user_id=$1 AND day=$2 ORDER BY id`, [uid, day]);
   return { day, editable: canEditDay(user, day), items: rows.map(rowExpense) };
 });
 
-function targetUserId(user, raw) {
-  if (raw && user.is_admin) {
-    const id = Number(raw);
-    if (!Number.isInteger(id) || id <= 0) throw bad('用户不对');
-    return id;
-  }
+async function targetUserId(user, raw) {
+  if (raw && user.is_admin) return (await userInScope(user, raw)).id;
   return user.id;
 }
 
@@ -274,7 +295,7 @@ route('POST', '/api/expenses', async ({ user, body }) => {
   const item = cleanText(body.item, 40);
   const cents = parseAmount(body.amount);
   if (!cents) throw bad('金额不对');
-  const uid = targetUserId(user, body.user_id);
+  const uid = await targetUserId(user, body.user_id);
   const { rows: [r] } = await db.query(
     `INSERT INTO expenses(user_id,day,meal,item,cents,admin_edited) VALUES($1,$2,$3,$4,$5,$6)
      RETURNING ${EXP_COLS}`, [uid, day, body.meal, item, cents, uid !== user.id]);
@@ -286,7 +307,11 @@ route('POST', '/api/expenses', async ({ user, body }) => {
 async function loadOwnExpense(user, id) {
   const { rows: [r] } = await db.query(
     `SELECT ${EXP_COLS} FROM expenses WHERE id=$1`, [id]);
-  if (!r || (r.user_id !== user.id && !user.is_admin)) throw new HttpError(404, '记录不存在');
+  if (!r) throw new HttpError(404, '记录不存在');
+  if (r.user_id !== user.id) {
+    if (!user.is_admin) throw new HttpError(404, '记录不存在');
+    await userInScope(user, r.user_id).catch(() => { throw new HttpError(404, '记录不存在'); });
+  }
   if (!canEditDay(user, r.day)) throw new HttpError(403, '这条记录太早了，不能再修改，请联系管理员');
   return r;
 }
@@ -323,7 +348,7 @@ route('DELETE', '/api/expenses/:id', async ({ user, params }) => {
 route('GET', '/api/history', async ({ user, query }) => {
   const month = query.get('month') || todayStr().slice(0, 7);
   if (!MONTH_RE.test(month) || !validDay(month + '-01')) throw bad('月份不对');
-  const uid = targetUserId(user, query.get('user_id'));
+  const uid = await targetUserId(user, query.get('user_id'));
   const from = month + '-01';
   const { rows } = await db.query(
     `SELECT ${EXP_COLS} FROM expenses
@@ -341,7 +366,7 @@ route('GET', '/api/history', async ({ user, query }) => {
 
 // 最近 30 天每日合计 + 本周/本月合计
 route('GET', '/api/stats', async ({ user, query }) => {
-  const uid = targetUserId(user, query.get('user_id'));
+  const uid = await targetUserId(user, query.get('user_id'));
   const today = todayStr();
   const from = addDays(today, -29);
   const { rows } = await db.query(
@@ -369,10 +394,12 @@ route('GET', '/api/analytics', async ({ user, query }) => {
   const span = Math.round((Date.parse(to) - Date.parse(from)) / 86400000) + 1;
   if (span > 800) throw bad('时间范围太长');
   const all = user.is_admin && query.get('user_id') === 'all';
-  const uid = all ? null : targetUserId(user, query.get('user_id'));
-  // $1 from, $2 to, $3 uid(或 null 表示所有人)
-  const W = `day >= $1 AND day <= $2 AND ($3::int IS NULL OR user_id=$3)`;
-  const args = [from, to, uid];
+  const uid = all ? null : await targetUserId(user, query.get('user_id'));
+  const dept = all ? await adminDept(user, query.get('dept')) : null;
+  // $1 from, $2 to, $3 uid（null=所有人）, $4 部门（只在所有人时生效）
+  const SCOPE = `($3::int IS NULL OR user_id=$3) AND ($4::int IS NULL OR user_id IN (SELECT id FROM users WHERE dept_id=$4))`;
+  const W = `day >= $1 AND day <= $2 AND ${SCOPE}`;
+  const args = [from, to, uid, dept];
 
   const [daily, meals, items, weekday, prev, monthly] = await Promise.all([
     db.query(`SELECT to_char(day,'YYYY-MM-DD') AS day, SUM(cents)::int AS cents FROM expenses WHERE ${W} GROUP BY day`, args),
@@ -380,12 +407,11 @@ route('GET', '/api/analytics', async ({ user, query }) => {
     db.query(`SELECT item, SUM(cents)::int AS cents, COUNT(*)::int AS n FROM expenses WHERE ${W} AND item <> ''
               GROUP BY item ORDER BY SUM(cents) DESC, COUNT(*) DESC LIMIT 8`, args),
     db.query(`SELECT EXTRACT(ISODOW FROM day)::int AS dow, SUM(cents)::int AS cents FROM expenses WHERE ${W} GROUP BY 1`, args),
-    db.query(`SELECT COALESCE(SUM(cents),0)::int AS cents FROM expenses
-              WHERE day >= $1 AND day <= $2 AND ($3::int IS NULL OR user_id=$3)`,
-              [addDays(from, -span), addDays(from, -1), uid]),
+    db.query(`SELECT COALESCE(SUM(cents),0)::int AS cents FROM expenses WHERE day >= $1 AND day <= $2 AND ${SCOPE}`,
+              [addDays(from, -span), addDays(from, -1), uid, dept]),
     db.query(`SELECT to_char(date_trunc('month',day),'YYYY-MM') AS month, SUM(cents)::int AS cents FROM expenses
-              WHERE day >= (date_trunc('month',$1::date) - interval '11 months') AND day <= $1
-                AND ($2::int IS NULL OR user_id=$2) GROUP BY 1`, [to, uid]),
+              WHERE day >= (date_trunc('month',$1::date) - interval '11 months') AND day <= $2::date AND ${SCOPE} GROUP BY 1`,
+              [to, to, uid, dept]),
   ]);
 
   const dmap = new Map(daily.rows.map((r) => [r.day, r.cents]));
@@ -421,9 +447,10 @@ route('GET', '/api/analytics', async ({ user, query }) => {
     const [byUser, tops] = await Promise.all([
       db.query(`SELECT u.id, u.display_name, COALESCE(SUM(e.cents),0)::int AS cents, COUNT(DISTINCT e.day)::int AS days
                 FROM users u LEFT JOIN expenses e ON e.user_id=u.id AND e.day >= $1 AND e.day <= $2
-                GROUP BY u.id ORDER BY cents DESC, u.id`, [from, to]),
+                WHERE u.dept_id=$3 GROUP BY u.id ORDER BY cents DESC, u.id`, [from, to, dept]),
       db.query(`SELECT COALESCE(SUM(cents),0)::int AS cents FROM topups WHERE status='done'
-                AND (created_at AT TIME ZONE '${TZ}')::date BETWEEN $1 AND $2`, [from, to]),
+                AND (created_at AT TIME ZONE '${TZ}')::date BETWEEN $1 AND $2
+                AND user_id IN (SELECT id FROM users WHERE dept_id=$3)`, [from, to, dept]),
     ]);
     out.byUser = byUser.rows.map((r) => ({ id: r.id, name: r.display_name, cents: r.cents, days: r.days }));
     out.topupCents = tops.rows[0].cents;
@@ -446,18 +473,19 @@ route('GET', '/api/export', async ({ user, query }) => {
   if (!validDay(from) || !validDay(to) || from > to) throw bad('日期不对');
   if ((Date.parse(to) - Date.parse(from)) / 86400000 > 1100) throw bad('时间范围太长');
   const all = user.is_admin && query.get('user_id') === 'all';
-  const uid = all ? null : targetUserId(user, query.get('user_id'));
+  const uid = all ? null : await targetUserId(user, query.get('user_id'));
+  const dept = all ? await adminDept(user, query.get('dept')) : null;
   const { rows: ex } = await db.query(`
     SELECT to_char(e.day,'YYYY-MM-DD') AS day, EXTRACT(ISODOW FROM e.day)::int AS dow, e.meal, e.item, e.cents,
            u.id AS uid, u.display_name
     FROM expenses e JOIN users u ON u.id=e.user_id
-    WHERE e.day >= $1 AND e.day <= $2 AND ($3::int IS NULL OR e.user_id=$3)
-    ORDER BY e.day, u.id, array_position(ARRAY['breakfast','lunch','dinner','other'], e.meal), e.id`, [from, to, uid]);
+    WHERE e.day >= $1 AND e.day <= $2 AND ($3::int IS NULL OR e.user_id=$3) AND ($4::int IS NULL OR u.dept_id=$4)
+    ORDER BY e.day, u.id, array_position(ARRAY['breakfast','lunch','dinner','other'], e.meal), e.id`, [from, to, uid, dept]);
   const { rows: tops } = await db.query(`
     SELECT to_char(t.created_at AT TIME ZONE '${TZ}','YYYY-MM-DD HH24:MI') AS at, u.display_name, t.cents, t.status, t.note
     FROM topups t JOIN users u ON u.id=t.user_id
-    WHERE (t.created_at AT TIME ZONE '${TZ}')::date BETWEEN $1 AND $2 AND ($3::int IS NULL OR t.user_id=$3)
-    ORDER BY t.created_at`, [from, to, uid]);
+    WHERE (t.created_at AT TIME ZONE '${TZ}')::date BETWEEN $1 AND $2 AND ($3::int IS NULL OR t.user_id=$3) AND ($4::int IS NULL OR u.dept_id=$4)
+    ORDER BY t.created_at`, [from, to, uid, dept]);
 
   const Y = (c) => c / 100;
   const WK = ['', '周一', '周二', '周三', '周四', '周五', '周六', '周日'];
@@ -502,7 +530,7 @@ route('GET', '/api/export', async ({ user, query }) => {
       SELECT u.id, u.display_name, u.username,
         COALESCE((SELECT SUM(cents) FROM topups t WHERE t.user_id=u.id AND status='done'),0)
           - COALESCE((SELECT SUM(cents) FROM expenses e WHERE e.user_id=u.id),0) AS balance
-      FROM users u ORDER BY u.id`);
+      FROM users u WHERE u.dept_id=$1 ORDER BY u.id`, [dept]);
     const per = us.map((u) => {
       const mine = ex.filter((r) => r.uid === u.id);
       const m = Object.fromEntries(mealKeys.map((k) => [k, sum(mine.filter((r) => r.meal === k).map((r) => r.cents))]));
@@ -527,7 +555,7 @@ route('GET', '/api/export', async ({ user, query }) => {
     rows: tops.map((t) => [t.at, ...(all ? [t.display_name] : []), Y(t.cents), ST[t.status], t.note]),
   });
 
-  let who = '全部';
+  let who = all ? (await db.query(`SELECT name FROM departments WHERE id=$1`, [dept])).rows[0].name + '全部' : '全部';
   if (!all) { const { rows: [u] } = await db.query(`SELECT display_name FROM users WHERE id=$1`, [uid]); who = u ? u.display_name : '用户'; }
   return { __file: { name: `饭钱账本_${who}_${from}至${to}.xlsx`, data: buildXlsx(sheets),
     type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' } };
@@ -568,17 +596,19 @@ route('DELETE', '/api/topups/:id', async ({ user, params }) => {
 });
 
 // ---------- 管理员 ----------
-route('GET', '/api/admin/users', async () => {
+route('GET', '/api/admin/users', async ({ user, query }) => {
+  const dept = await adminDept(user, query.get('dept'));
   const { rows } = await db.query(`
-    SELECT u.id,u.username,u.display_name,u.is_admin,u.disabled,
+    SELECT u.id,u.username,u.display_name,u.is_admin,u.is_super,u.dept_id,u.disabled,
       COALESCE((SELECT SUM(cents) FROM topups t WHERE t.user_id=u.id AND status='done'),0)
         - COALESCE((SELECT SUM(cents) FROM expenses e WHERE e.user_id=u.id),0) AS balance,
       COALESCE((SELECT SUM(cents) FROM expenses e WHERE e.user_id=u.id
         AND day >= date_trunc('month', $1::date)),0) AS month_spent,
       (SELECT to_char(MAX(day),'YYYY-MM-DD') FROM expenses e WHERE e.user_id=u.id) AS last_day
-    FROM users u ORDER BY u.disabled, u.id`, [todayStr()]);
+    FROM users u WHERE u.dept_id=$2 ORDER BY u.disabled, u.id`, [todayStr(), dept]);
   return rows.map((r) => ({
-    id: r.id, username: r.username, displayName: r.display_name, isAdmin: r.is_admin, disabled: r.disabled,
+    id: r.id, username: r.username, displayName: r.display_name, isAdmin: r.is_admin || r.is_super, isSuper: r.is_super,
+    deptId: r.dept_id, disabled: r.disabled,
     balanceCents: Number(r.balance), monthSpentCents: Number(r.month_spent), lastDay: r.last_day,
   }));
 }, { auth: 'admin' });
@@ -589,10 +619,11 @@ route('POST', '/api/admin/users', async ({ user, body }) => {
   const displayName = cleanText(body.displayName, 20) || username;
   const password = body.password ? String(body.password) : memorablePassword();
   if (password.length < 6 || password.length > 100) throw bad('密码至少 6 位');
+  const dept = await adminDept(user, body.deptId);
   try {
     const { rows: [u] } = await db.query(
-      `INSERT INTO users(username,display_name,pw_hash,is_admin) VALUES($1,$2,$3,$4) RETURNING id`,
-      [username, displayName, hashPassword(password), !!body.isAdmin]);
+      `INSERT INTO users(username,display_name,pw_hash,is_admin,dept_id) VALUES($1,$2,$3,$4,$5) RETURNING id`,
+      [username, displayName, hashPassword(password), !!body.isAdmin, dept]);
     await audit(db, user.id, u.id, 'user.create', `新建用户 ${displayName}（${username}）${body.isAdmin ? '，管理员' : ''}`);
     return { id: u.id, username, password };
   } catch (e) {
@@ -602,9 +633,10 @@ route('POST', '/api/admin/users', async ({ user, body }) => {
 }, { auth: 'admin' });
 
 route('PUT', '/api/admin/users/:id', async ({ user, params, body }) => {
-  const id = Number(params.id);
-  const { rows: [u] } = await db.query(`SELECT * FROM users WHERE id=$1`, [id]);
-  if (!u) throw new HttpError(404, '用户不存在');
+  const u = await userInScope(user, params.id);
+  const id = u.id;
+  // 部门管理员不能动总管理员
+  if (u.is_super && !user.is_super) throw new HttpError(403, '不能修改总管理员');
   const out = { ok: true };
   if (body.displayName !== undefined) {
     const n = cleanText(body.displayName, 20);
@@ -618,11 +650,22 @@ route('PUT', '/api/admin/users/:id', async ({ user, params, body }) => {
       await db.query(`UPDATE users SET disabled=$1 WHERE id=$2`, [!!body.disabled, id]);
       await audit(db, user.id, id, body.disabled ? 'user.disable' : 'user.enable', body.disabled ? '停用账号' : '启用账号');
     }
-    if (body.isAdmin !== undefined) {
+    if (body.isAdmin !== undefined && !!body.isAdmin !== u.is_admin) {
+      if (u.is_super) throw bad('总管理员不需要单独设置');
       await db.query(`UPDATE users SET is_admin=$1 WHERE id=$2`, [!!body.isAdmin, id]);
-      await audit(db, user.id, id, 'user.role', body.isAdmin ? '设为管理员' : '取消管理员');
+      await audit(db, user.id, id, 'user.role', body.isAdmin ? '设为部门管理员' : '取消部门管理员');
     }
-    await db.query(`DELETE FROM sessions WHERE user_id=$1`, [id]);
+    // 停用要立刻踢下线；改角色不用（每次请求都会重新读取角色）
+    if (body.disabled) await db.query(`DELETE FROM sessions WHERE user_id=$1`, [id]);
+  }
+  if (body.deptId !== undefined && Number(body.deptId) !== u.dept_id) {
+    if (!user.is_super) throw new HttpError(403, '只有总管理员能调整部门');
+    if (id === user.id) throw bad('不能调整自己的部门');
+    const { rows: [d] } = await db.query(`SELECT id, name FROM departments WHERE id=$1`, [Number(body.deptId) || 0]);
+    if (!d) throw bad('部门不存在');
+    const { rows: [from] } = await db.query(`SELECT name FROM departments WHERE id=$1`, [u.dept_id]);
+    await db.query(`UPDATE users SET dept_id=$1 WHERE id=$2`, [d.id, id]);
+    await audit(db, user.id, id, 'user.move', `从「${from.name}」调到「${d.name}」（余额随人转过去）`);
   }
   if (body.resetPassword) {
     const pw = typeof body.resetPassword === 'string' ? body.resetPassword : memorablePassword();
@@ -635,10 +678,11 @@ route('PUT', '/api/admin/users/:id', async ({ user, params, body }) => {
   return out;
 }, { auth: 'admin' });
 
-route('GET', '/api/admin/topups', async ({ query }) => {
+route('GET', '/api/admin/topups', async ({ user, query }) => {
   const status = query.get('status');
   const uid = query.get('user_id');
   const where = []; const args = [];
+  args.push(await adminDept(user, query.get('dept'))); where.push(`u.dept_id=$${args.length}`);
   if (status) { args.push(status); where.push(`t.status=$${args.length}`); }
   if (uid) { args.push(Number(uid)); where.push(`t.user_id=$${args.length}`); }
   const { rows } = await db.query(`
@@ -657,8 +701,9 @@ route('POST', '/api/admin/topups', async ({ user, body }) => {
   try {
     await client.query('BEGIN');
     // 锁住该用户，防止同时操作时差额算错
-    const { rows: [u] } = await client.query(`SELECT id FROM users WHERE id=$1 FOR UPDATE`, [uid]);
-    if (!u) throw bad('用户不存在');
+    const target = await userInScope(user, uid, client);
+    if (target.is_super && !user.is_super) throw new HttpError(403, '不能调整总管理员的余额');
+    await client.query(`SELECT id FROM users WHERE id=$1 FOR UPDATE`, [uid]);
     let cents, finalNote = note;
     if (body.setTo !== undefined) {
       const s = String(body.setTo).trim();
@@ -692,26 +737,28 @@ route('POST', '/api/admin/topups', async ({ user, body }) => {
 
 route('POST', '/api/admin/topups/:id/approve', async ({ user, params }) => {
   const { rows: [t] } = await db.query(
-    `UPDATE topups SET status='done',decided_at=now() WHERE id=$1 AND status='pending' RETURNING user_id,cents`, [params.id]);
+    `UPDATE topups SET status='done',decided_at=now() WHERE id=$1 AND status='pending'
+       AND ($2 OR user_id IN (SELECT id FROM users WHERE dept_id=$3)) RETURNING user_id,cents`, [params.id, user.is_super, user.dept_id]);
   if (!t) throw new HttpError(404, '找不到待确认的记录');
   await audit(db, user.id, t.user_id, 'topup.approve', `确认充值 ${fmtY(t.cents)} 已入账`);
   return { ok: true };
 }, { auth: 'admin' });
 route('POST', '/api/admin/topups/:id/reject', async ({ user, params }) => {
   const { rows: [t] } = await db.query(
-    `UPDATE topups SET status='rejected',decided_at=now() WHERE id=$1 AND status='pending' RETURNING user_id,cents`, [params.id]);
+    `UPDATE topups SET status='rejected',decided_at=now() WHERE id=$1 AND status='pending'
+       AND ($2 OR user_id IN (SELECT id FROM users WHERE dept_id=$3)) RETURNING user_id,cents`, [params.id, user.is_super, user.dept_id]);
   if (!t) throw new HttpError(404, '找不到待确认的记录');
   await audit(db, user.id, t.user_id, 'topup.reject', `拒绝充值申请 ${fmtY(t.cents)}`);
   return { ok: true };
 }, { auth: 'admin' });
 
 // 所有人的消费记录（可按用户、日期筛选）
-route('GET', '/api/admin/expenses', async ({ query }) => {
+route('GET', '/api/admin/expenses', async ({ user, query }) => {
   const from = query.get('from') || addDays(todayStr(), -6);
   const to = query.get('to') || todayStr();
   if (!validDay(from) || !validDay(to)) throw bad('日期不对');
-  const args = [from, to]; let extra = '';
-  if (query.get('user_id')) { args.push(Number(query.get('user_id'))); extra = ` AND e.user_id=$3`; }
+  const args = [from, to, await adminDept(user, query.get('dept'))]; let extra = ' AND u.dept_id=$3';
+  if (query.get('user_id')) { args.push(Number(query.get('user_id')) || 0); extra += ` AND e.user_id=$4`; }
   const { rows } = await db.query(`
     SELECT e.id,e.user_id,u.display_name,to_char(e.day,'YYYY-MM-DD') AS day,e.meal,e.item,e.cents,e.admin_edited,
       to_char(e.created_at AT TIME ZONE '${TZ}','HH24:MI') AS time
@@ -720,6 +767,45 @@ route('GET', '/api/admin/expenses', async ({ query }) => {
     ORDER BY e.day DESC, u.id, e.id LIMIT 2000`, args);
   return rows.map((r) => ({ ...rowExpense(r), displayName: r.display_name }));
 }, { auth: 'admin' });
+
+// ---------- 部门 ----------
+// 部门列表：总管理员看全部，部门管理员只看自己部门
+route('GET', '/api/admin/depts', async ({ user }) => {
+  const { rows } = await db.query(`
+    SELECT d.id, d.name,
+      (SELECT COUNT(*) FROM users u WHERE u.dept_id=d.id AND NOT u.disabled)::int AS members,
+      COALESCE((SELECT SUM(t.cents) FROM topups t JOIN users u ON u.id=t.user_id WHERE u.dept_id=d.id AND t.status='done'),0)
+        - COALESCE((SELECT SUM(e.cents) FROM expenses e JOIN users u ON u.id=e.user_id WHERE u.dept_id=d.id),0) AS pool
+    FROM departments d WHERE $1 OR d.id=$2 ORDER BY d.id`, [user.is_super, user.dept_id]);
+  return rows.map((r) => ({ id: r.id, name: r.name, members: r.members, poolCents: Number(r.pool) }));
+}, { auth: 'admin' });
+route('POST', '/api/admin/depts', async ({ user, body }) => {
+  const name = cleanText(body.name, 20);
+  if (!name) throw bad('请填写部门名称');
+  try {
+    const { rows: [d] } = await db.query(`INSERT INTO departments(name) VALUES($1) RETURNING id`, [name]);
+    await audit(db, user.id, null, 'dept.create', `新建部门「${name}」`);
+    return { id: d.id, name };
+  } catch (e) { if (e.code === '23505') throw bad('已有同名部门'); throw e; }
+}, { auth: 'super' });
+route('PUT', '/api/admin/depts/:id', async ({ user, params, body }) => {
+  const name = cleanText(body.name, 20);
+  if (!name) throw bad('请填写部门名称');
+  const { rows: [d] } = await db.query(`SELECT name FROM departments WHERE id=$1`, [params.id]);
+  if (!d) throw new HttpError(404, '部门不存在');
+  try { await db.query(`UPDATE departments SET name=$1 WHERE id=$2`, [name, params.id]); }
+  catch (e) { if (e.code === '23505') throw bad('已有同名部门'); throw e; }
+  if (name !== d.name) await audit(db, user.id, null, 'dept.rename', `部门改名「${d.name}」→「${name}」`);
+  return { ok: true };
+}, { auth: 'super' });
+route('DELETE', '/api/admin/depts/:id', async ({ user, params }) => {
+  const { rows: [d] } = await db.query(`SELECT name, (SELECT COUNT(*) FROM users WHERE dept_id=$1)::int AS n FROM departments WHERE id=$1`, [params.id]);
+  if (!d) throw new HttpError(404, '部门不存在');
+  if (d.n > 0) throw bad('部门里还有人（含已停用的），先把人调走才能删除');
+  await db.query(`DELETE FROM departments WHERE id=$1`, [params.id]);
+  await audit(db, user.id, null, 'dept.delete', `删除部门「${d.name}」`);
+  return { ok: true };
+}, { auth: 'super' });
 
 // ---------- 日志查询 ----------
 function rowAudit(r) {
@@ -735,8 +821,8 @@ route('GET', '/api/audit/mine', async ({ user }) => {
   return rows.map(rowAudit);
 });
 // 管理员看全部日志：可按用户筛选，可只看"管理员动了别人的账"
-route('GET', '/api/admin/audit', async ({ query }) => {
-  const args = []; const where = [];
+route('GET', '/api/admin/audit', async ({ user, query }) => {
+  const args = [await adminDept(user, query.get('dept'))]; const where = ['COALESCE(ut.dept_id, ua.dept_id) = $1'];
   if (query.get('user_id')) { args.push(Number(query.get('user_id'))); where.push(`(a.target_user_id=$${args.length} OR a.actor_id=$${args.length})`); }
   if (query.get('others') === '1') where.push(`a.actor_id IS DISTINCT FROM a.target_user_id`);
   const { rows } = await db.query(`${AUDIT_SQL} ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
@@ -806,6 +892,7 @@ const server = http.createServer(async (req, res) => {
       if (!user) throw new HttpError(401, '请先登录');
       if (user.renewToken) res.setHeader('Set-Cookie', sessionCookie(user.renewToken, SESSION_DAYS * 86400));
       if (r.auth === 'admin' && !user.is_admin) throw new HttpError(403, '需要管理员权限');
+      if (r.auth === 'super' && !user.is_super) throw new HttpError(403, '需要总管理员权限');
     }
     const result = await r.handler({ req, res, user, params, body, query: url.searchParams });
     if (result && result.__file) {
@@ -835,10 +922,10 @@ async function main() {
     const [, , , username, displayName, pw] = process.argv;
     const password = pw || memorablePassword();
     await db.query(
-      `INSERT INTO users(username,display_name,pw_hash,is_admin) VALUES($1,$2,$3,true)
-       ON CONFLICT (username) DO UPDATE SET pw_hash=EXCLUDED.pw_hash, is_admin=true, disabled=false`,
+      `INSERT INTO users(username,display_name,pw_hash,is_admin,is_super) VALUES($1,$2,$3,true,true)
+       ON CONFLICT (username) DO UPDATE SET pw_hash=EXCLUDED.pw_hash, is_admin=true, is_super=true, disabled=false`,
       [username.toLowerCase(), displayName || username, hashPassword(password)]);
-    console.log(`管理员 ${username} 的密码：${password}`);
+    console.log(`总管理员 ${username} 的密码：${password}`);
     await db.end();
     return;
   }

@@ -8,4 +8,6 @@ UPDATE topups SET created_by=NULL WHERE created_by IN (SELECT id FROM zz);
 DELETE FROM sessions WHERE user_id IN (SELECT id FROM zz);
 DELETE FROM users WHERE id IN (SELECT id FROM zz);
 DELETE FROM login_fails WHERE key LIKE 'zz%';
+DELETE FROM audit_log WHERE action LIKE 'dept.%' AND detail LIKE '%zz%';
+DELETE FROM departments WHERE name LIKE 'zz%' AND id <> 1;
 COMMIT;

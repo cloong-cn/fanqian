@@ -168,7 +168,14 @@ function header(title, right = '') {
   return `<header class="top"><div><div class="title">${title}</div></div><div class="right">${right}</div></header>`;
 }
 
-async function refreshMe() { me = await api('GET', '/api/me'); }
+async function refreshMe() {
+  me = await api('GET', '/api/me');
+  if (!me.user.isSuper || !state.adminDept) state.adminDept = me.dept.id;
+}
+// 管理员接口带上当前操作的部门（只有总管理员能切换部门）
+const withDept = (url) => (me && me.user.isSuper ? url + (url.includes('?') ? '&' : '?') + 'dept=' + state.adminDept : url);
+const deptName = (id) => ((state.depts || []).find((d) => d.id === id) || {}).name || (me.dept && me.dept.id === id ? me.dept.name : '');
+async function loadDepts() { state.depts = await api('GET', '/api/admin/depts'); return state.depts; }
 
 // ---------- 登录 ----------
 // 表单登录失败时服务器会跳回 /?e=bad&u=xxx；页面加载时读一次，然后清掉地址栏参数
@@ -222,7 +229,7 @@ function heroCard(monthCents) {
     <div class="big num ${me.balanceCents < 0 ? 'neg' : ''}"><span class="cur">¥</span>${countSpan(me.balanceCents, 'bal', { cur: false })}</div>
     <button class="pill" data-go="#/topup">充值</button>
     <div class="row4">
-      <div><div class="k">账户总余额</div><div class="v num">${countSpan(me.poolCents, 'pool')}</div></div>
+      <div><div class="k">部门总余额</div><div class="v num">${countSpan(me.poolCents, 'pool')}</div></div>
       <div><div class="k">今日大家共花</div><div class="v num">${countSpan(me.todayAllCents, 'today-all')}</div></div>
       <div><div class="k">我本月已花</div><div class="v num">${countSpan(monthCents, 'month')}</div></div>
       <div><div class="k">我今日已花</div><div class="v num" id="hero-today">—</div></div>
@@ -263,7 +270,7 @@ async function renderHome() {
 
   const isOld = state.day < yesterday;
   shell('home', `
-    <header class="top"><div><div class="hello">${greeting()}</div><div class="title">${esc(me.user.displayName)}</div></div>
+    <header class="top"><div><div class="hello">${greeting()}${me.deptCount > 1 ? ' · ' + esc(me.dept.name) : ''}</div><div class="title">${esc(me.user.displayName)}</div></div>
       <div class="right">${md(me.today)}<br>周${WEEK[dow(me.today)]}</div></header>
     ${heroCard(stats.monthCents)}
     <div class="daybar">
@@ -607,9 +614,10 @@ async function renderStats() {
   const scope = me.user.isAdmin ? state.statScope : '';
   const q = new URLSearchParams({ from, to });
   if (scope) q.set('user_id', scope);
+  if (scope === 'all' && me.user.isSuper) q.set('dept', state.adminDept);
   const [a, users] = await Promise.all([
     api('GET', '/api/analytics?' + q),
-    me.user.isAdmin && !statUsers ? api('GET', '/api/admin/users') : Promise.resolve(statUsers),
+    me.user.isAdmin && !statUsers ? api('GET', withDept('/api/admin/users')) : Promise.resolve(statUsers),
   ]);
   statUsers = users;
   const all = scope === 'all';
@@ -645,7 +653,7 @@ async function renderStats() {
       <span class="pct num">${mealTotal ? Math.round(m.cents / mealTotal * 100) : 0}%</span></div>`).join('')}</div>` : '<div class="muted small">暂无数据</div>';
 
   const userOpts = me.user.isAdmin ? `<div class="field" style="margin-bottom:10px"><select id="scope">
-      <option value="">我自己</option><option value="all" ${all ? 'selected' : ''}>所有人合计</option>
+      <option value="">我自己</option><option value="all" ${all ? 'selected' : ''}>${esc(deptName(state.adminDept))}所有人合计</option>
       ${users.filter((u) => u.id !== me.user.id).map((u) => `<option value="${u.id}" ${String(u.id) === scope ? 'selected' : ''}>${esc(u.displayName)}</option>`).join('')}
     </select></div>` : '';
 
@@ -693,6 +701,7 @@ window.addEventListener('resize', () => { clearTimeout(resizeT); resizeT = setTi
 async function downloadExport(from, to, scope) {
   const q = new URLSearchParams({ from, to });
   if (scope) q.set('user_id', scope);
+  if (scope === 'all' && me.user.isSuper) q.set('dept', state.adminDept);
   const res = await fetch('/api/export?' + q);
   if (!res.ok) { const d = await res.json().catch(() => ({})); throw new Error(d.error || '导出失败'); }
   const blob = await res.blob();
@@ -707,11 +716,11 @@ async function downloadExport(from, to, scope) {
 async function exportSheet({ from, to, scope = '' } = {}) {
   if (!from) [from, to] = periodRange('month');
   let users = [];
-  if (me.user.isAdmin) users = statUsers || (statUsers = await api('GET', '/api/admin/users'));
+  if (me.user.isAdmin) users = statUsers || (statUsers = await api('GET', withDept('/api/admin/users')));
   const quick = [['month', '本月'], ['last', '上月'], ['90', '近90天'], ['year', '今年']];
   openSheet(`<h2>导出 Excel</h2>
     ${me.user.isAdmin ? `<div class="field"><label>导出谁的</label><select id="xs">
-      <option value="">我自己</option><option value="all" ${scope === 'all' ? 'selected' : ''}>所有人</option>
+      <option value="">我自己</option><option value="all" ${scope === 'all' ? 'selected' : ''}>${esc(deptName(state.adminDept))}所有人</option>
       ${users.filter((u) => u.id !== me.user.id).map((u) => `<option value="${u.id}" ${String(u.id) === scope ? 'selected' : ''}>${esc(u.displayName)}</option>`).join('')}
     </select></div>` : ''}
     <div class="field"><label>时间范围</label><div class="date-row"><input type="date" id="xf" value="${from}" max="${me.today}"><input type="date" id="xt" value="${to}" max="${me.today}"></div></div>
@@ -771,8 +780,8 @@ function renderMe() {
     ${header('我的')}
     <div class="card" style="display:flex;align-items:center;gap:14px">
       <div class="avatar lg">${initial(me.user.displayName)}</div>
-      <div><div style="font-weight:600;font-size:17px">${esc(me.user.displayName)}${me.user.isAdmin ? '<span class="badge accent">管理员</span>' : ''}</div>
-      <div class="small muted">用户名 ${esc(me.user.username)}</div></div>
+      <div><div style="font-weight:600;font-size:17px">${esc(me.user.displayName)}${me.user.isSuper ? '<span class="badge accent">总管理员</span>' : me.user.isAdmin ? '<span class="badge accent">管理员</span>' : ''}</div>
+      <div class="small muted">用户名 ${esc(me.user.username)}${me.deptCount > 1 ? ' · ' + esc(me.dept.name) : ''}</div></div>
       <div style="margin-left:auto;text-align:right"><div class="small muted">余额</div><div class="num ${me.balanceCents < 0 ? 'neg' : ''}" style="font-weight:700;font-size:18px">${yuan(me.balanceCents)}</div></div>
     </div>
     <div class="card flush"><ul class="list">
@@ -821,18 +830,64 @@ async function renderMyLog() {
 // ---------- 管理 ----------
 async function renderAdmin() {
   const tab = state.adminTab;
-  const pending = await api('GET', '/api/admin/topups?status=pending');
+  const [pending, depts] = await Promise.all([api('GET', withDept('/api/admin/topups?status=pending')), loadDepts()]);
   const tabs = [['users', '用户'], ['topups', '充值'], ['expenses', '消费'], ['audit', '日志']];
-  const head = `${header('管理')}<div class="seg full" style="margin-bottom:14px">${tabs.map(([k, n]) =>
+  if (me.user.isSuper) tabs.push(['depts', '部门']);
+  // 总管理员：顶部切换正在管理的部门
+  const switcher = me.user.isSuper && depts.length > 1 && tab !== 'depts' ? `<div class="field" style="margin-bottom:10px"><select id="ad">${depts.map((d) =>
+    `<option value="${d.id}" ${d.id === state.adminDept ? 'selected' : ''}>${esc(d.name)}（${d.members} 人）</option>`).join('')}</select></div>` : '';
+  const head = `${header('管理', me.deptCount > 1 && !me.user.isSuper ? esc(me.dept.name) : '')}${switcher}<div class="seg full" style="margin-bottom:14px">${tabs.map(([k, n]) =>
     `<button data-t="${k}" class="${k === tab ? 'on' : ''}">${n}${k === 'topups' && pending.length ? ` <span class="badge count">${pending.length}</span>` : ''}</button>`).join('')}</div>`;
   let body, mount;
   if (tab === 'users') [body, mount] = await adminUsers();
   else if (tab === 'topups') [body, mount] = await adminTopups();
   else if (tab === 'audit') [body, mount] = await adminAudit();
+  else if (tab === 'depts' && me.user.isSuper) [body, mount] = await adminDepts(depts);
   else [body, mount] = await adminExpenses();
   shell('admin', head + body, { pendingBadge: pending.length > 0 });
   $app.querySelectorAll('[data-t]').forEach((b) => b.onclick = () => { state.adminTab = b.dataset.t; renderAdmin().then(() => trackPage(currentPagePath())).catch(fail); });
+  const ad = document.getElementById('ad');
+  if (ad) ad.onchange = () => { state.adminDept = Number(ad.value); statUsers = null; state.adminFilter = null; state.auditFilter = null; renderAdmin().catch(fail); };
   mount();
+}
+
+async function adminDepts(depts) {
+  const html = `<div class="section-title"><h3>部门 ${depts.length}</h3><span class="extra">各部门的钱和记录互相独立</span></div>
+    <div class="card flush"><ul class="list">${depts.map((d) => `<li data-d="${d.id}">
+      <div class="avatar">${initial(d.name)}</div>
+      <div class="main"><div class="t">${esc(d.name)}${d.id === me.dept.id ? '<span class="badge">我所在</span>' : ''}</div><div class="d">${d.members} 人</div></div>
+      <div class="r"><div class="small muted">部门总余额</div><div class="num ${d.poolCents < 0 ? 'neg' : ''}" style="font-weight:600">${yuan(d.poolCents)}</div></div>${icon('chev', 'chev')}</li>`).join('')}</ul></div>
+    <button class="btn block" id="addd">${icon('plus')} 新建部门</button>
+    <p class="small muted" style="margin:12px 2px">新部门建好后，在顶部切换到该部门，再去「用户」里给它建人。也可以把某人设为「部门管理员」，让他自己管这个部门。</p>`;
+  const mount = () => {
+    const nameSheet = (title, value, onOk) => openSheet(`<h2>${title}</h2><div class="field"><input id="dn" maxlength="20" value="${esc(value)}" placeholder="例如 技术部"></div>
+      <div class="btns"><button class="btn soft" id="c">取消</button><button class="btn" id="o">保存</button></div>`, (s) => {
+      s.querySelector('#c').onclick = closeSheet;
+      s.querySelector('#o').onclick = async () => { try { await onOk(s.querySelector('#dn').value); closeSheet(); await refreshMe(); await renderAdmin(); } catch (e) { fail(e); } };
+    });
+    document.getElementById('addd').onclick = () => nameSheet('新建部门', '', async (name) => {
+      const d = await api('POST', '/api/admin/depts', { name });
+      state.adminDept = d.id; toast(`已新建「${d.name}」，已切换到该部门`);
+    });
+    $app.querySelectorAll('[data-d]').forEach((li) => li.onclick = () => {
+      const d = depts.find((x) => x.id === Number(li.dataset.d));
+      openSheet(`<h2>${esc(d.name)}</h2><div class="actions">
+        <button class="btn" data-x="go">${icon('me')} 管理这个部门的人</button>
+        <button class="btn soft" data-x="rename">改名</button>
+        ${d.members === 0 && d.id !== me.dept.id ? '<button class="btn danger" data-x="del">删除部门</button>' : ''}
+      </div>${d.members ? '<p class="small muted">部门里还有人，不能删除；可以先把人调到别的部门。</p>' : ''}`, (s) => {
+        s.querySelectorAll('[data-x]').forEach((b) => b.onclick = async () => {
+          if (b.dataset.x === 'go') { closeSheet(); state.adminDept = d.id; state.adminTab = 'users'; statUsers = null; renderAdmin().catch(fail); }
+          if (b.dataset.x === 'rename') nameSheet('部门改名', d.name, (name) => api('PUT', '/api/admin/depts/' + d.id, { name }));
+          if (b.dataset.x === 'del') {
+            if (!confirm(`删除部门「${d.name}」？`)) return;
+            try { await api('DELETE', '/api/admin/depts/' + d.id); if (state.adminDept === d.id) state.adminDept = me.dept.id; closeSheet(); await refreshMe(); await renderAdmin(); toast('已删除'); } catch (e) { fail(e); }
+          }
+        });
+      }, false);
+    });
+  };
+  return [html, mount];
 }
 
 function showPassword(username, pw) {
@@ -845,33 +900,33 @@ function showPassword(username, pw) {
 }
 
 async function adminUsers() {
-  const users = await api('GET', '/api/admin/users');
+  const users = await api('GET', withDept('/api/admin/users'));
   statUsers = users;
   const total = users.reduce((a, u) => a + u.balanceCents, 0);
   const html = `
     <div class="tiles">
-      <div class="tile"><div class="k">账户总余额</div><div class="v num ${total < 0 ? 'neg' : ''}">${yuan(total)}</div></div>
+      <div class="tile"><div class="k">部门总余额</div><div class="v num ${total < 0 ? 'neg' : ''}">${yuan(total)}</div></div>
       <div class="tile"><div class="k">本月总花费</div><div class="v num">${yuan(users.reduce((a, u) => a + u.monthSpentCents, 0))}</div></div>
     </div>
     <div class="section-title"><h3>用户 ${users.length}</h3><span class="extra">点用户查看操作</span></div>
     <div class="card flush"><ul class="list">${users.map((u) => `<li data-u="${u.id}">
       <div class="avatar">${initial(u.displayName)}</div>
-      <div class="main"><div class="t">${esc(u.displayName)}${u.isAdmin ? '<span class="badge accent">管理员</span>' : ''}${u.disabled ? '<span class="badge off">已停用</span>' : ''}</div>
+      <div class="main"><div class="t">${esc(u.displayName)}${u.isSuper ? '<span class="badge accent">总管理员</span>' : u.isAdmin ? '<span class="badge accent">管理员</span>' : ''}${u.disabled ? '<span class="badge off">已停用</span>' : ''}</div>
         <div class="d">${esc(u.username)} · 本月 ${yuan(u.monthSpentCents)} · 最近 ${u.lastDay ? md(u.lastDay) : '无记录'}</div></div>
       <div class="r num ${u.balanceCents < 0 ? 'neg' : ''}" style="font-weight:600">${yuan(u.balanceCents)}</div>${icon('chev', 'chev')}</li>`).join('')}</ul></div>
     <button class="btn block" id="add">${icon('plus')} 新建用户</button>`;
   const mount = () => {
-    document.getElementById('add').onclick = () => openSheet(`<h2>新建用户</h2>
+    document.getElementById('add').onclick = () => openSheet(`<h2>新建用户${me.deptCount > 1 ? ' · ' + esc(deptName(state.adminDept)) : ''}</h2>
       <div class="field"><label>用户名（登录用，小写字母/数字）</label><input id="nu" autocapitalize="off" autocorrect="off" maxlength="20" placeholder="例如 xiaowang"></div>
       <div class="field"><label>显示名字</label><input id="nd" maxlength="20" placeholder="例如 小王"></div>
       <div class="field"><label>密码</label><input id="np" maxlength="100" placeholder="留空自动生成好记的"></div>
       <div class="field"><label>初始充值（元）</label><input id="na" inputmode="decimal" placeholder="可不填"></div>
-      <label class="check"><input type="checkbox" id="nadm"> 设为管理员</label>
+      <label class="check"><input type="checkbox" id="nadm"> 设为部门管理员（可以管理本部门的人和账）</label>
       <div class="btns"><button class="btn soft" id="c">取消</button><button class="btn" id="o">创建</button></div>`, (s) => {
       s.querySelector('#c').onclick = closeSheet;
       s.querySelector('#o').onclick = async () => {
         try {
-          const r = await api('POST', '/api/admin/users', { username: s.querySelector('#nu').value, displayName: s.querySelector('#nd').value, password: s.querySelector('#np').value || undefined, isAdmin: s.querySelector('#nadm').checked });
+          const r = await api('POST', '/api/admin/users', { username: s.querySelector('#nu').value, displayName: s.querySelector('#nd').value, password: s.querySelector('#np').value || undefined, isAdmin: s.querySelector('#nadm').checked, deptId: me.user.isSuper ? state.adminDept : undefined });
           const amt = s.querySelector('#na').value.trim();
           if (amt) await api('POST', '/api/admin/topups', { userId: r.id, amount: amt, note: '初始充值' });
           await refreshMe(); await renderAdmin(); showPassword(r.username, r.password);
@@ -884,14 +939,17 @@ async function adminUsers() {
 }
 
 function userActions(u) {
+  const locked = u.isSuper && !me.user.isSuper;   // 部门管理员不能改总管理员
   openSheet(`<h2>${esc(u.displayName)} <span class="small muted">余额 ${yuan(u.balanceCents)}</span></h2>
     <div class="actions">
-      <button class="btn" data-a="topup">${icon('wallet')} 充值 / 调整余额</button>
+      ${locked ? '' : `<button class="btn" data-a="topup">${icon('wallet')} 充值 / 调整余额</button>`}
       <button class="btn soft" data-a="view">${icon('history')} 查看消费记录</button>
       <button class="btn soft" data-a="stats">${icon('stats')} 查看统计</button>
-      <button class="btn soft" data-a="pw">${icon('key')} 重置密码</button>
-      <button class="btn soft" data-a="rename">${icon('me')} 改名</button>
-      ${u.id !== me.user.id ? `<button class="btn ${u.disabled ? 'soft' : 'danger'}" data-a="toggle">${u.disabled ? '启用账号' : '停用账号'}</button>` : ''}
+      ${locked ? '' : `<button class="btn soft" data-a="pw">${icon('key')} 重置密码</button>
+      <button class="btn soft" data-a="rename">${icon('me')} 改名</button>`}
+      ${u.id !== me.user.id && !u.isSuper ? `<button class="btn soft" data-a="role">${icon('admin')} ${u.isAdmin ? '取消部门管理员' : '设为部门管理员'}</button>` : ''}
+      ${me.user.isSuper && u.id !== me.user.id && (state.depts || []).length > 1 ? `<button class="btn soft" data-a="move">${icon('out')} 调到其他部门</button>` : ''}
+      ${u.id !== me.user.id && !locked ? `<button class="btn ${u.disabled ? 'soft' : 'danger'}" data-a="toggle">${u.disabled ? '启用账号' : '停用账号'}</button>` : ''}
     </div>`, (s) => {
     s.querySelectorAll('[data-a]').forEach((b) => b.onclick = () => {
       const a = b.dataset.a;
@@ -955,6 +1013,20 @@ function userActions(u) {
         if (!confirm(`${u.disabled ? '启用' : '停用'} ${u.displayName}？${u.disabled ? '' : '\n停用后对方无法登录，记录和余额保留。'}`)) return;
         api('PUT', '/api/admin/users/' + u.id, { disabled: !u.disabled }).then(() => { closeSheet(); renderAdmin(); }).catch(fail);
       }
+      if (a === 'role') {
+        const to = !u.isAdmin;
+        if (!confirm(to ? `把 ${u.displayName} 设为部门管理员？\n他可以管理本部门所有人的账户和记录。` : `取消 ${u.displayName} 的部门管理员？`)) return;
+        api('PUT', '/api/admin/users/' + u.id, { isAdmin: to }).then(() => { closeSheet(); statUsers = null; renderAdmin(); toast(to ? '已设为部门管理员' : '已取消管理员'); }).catch(fail);
+      }
+      if (a === 'move') openSheet(`<h2>把 ${esc(u.displayName)} 调到</h2>
+        <div class="field"><select id="mv">${state.depts.filter((d) => d.id !== u.deptId).map((d) => `<option value="${d.id}">${esc(d.name)}</option>`).join('')}</select></div>
+        <p class="small muted">他的余额（${yuan(u.balanceCents)}）和历史记录会跟着一起过去，两个部门的总余额会相应变化。</p>
+        <div class="btns"><button class="btn soft" id="c">取消</button><button class="btn" id="o">确定调动</button></div>`, (s2) => {
+        s2.querySelector('#c').onclick = closeSheet;
+        s2.querySelector('#o').onclick = async () => {
+          try { await api('PUT', '/api/admin/users/' + u.id, { deptId: Number(s2.querySelector('#mv').value) }); closeSheet(); statUsers = null; await renderAdmin(); toast('已调动'); } catch (e) { fail(e); }
+        };
+      }, false);
       if (a === 'view') { closeSheet(); state.adminTab = 'expenses'; state.adminFilter = { userId: String(u.id) }; renderAdmin().catch(fail); }
       if (a === 'stats') { closeSheet(); state.statScope = u.id === me.user.id ? '' : String(u.id); location.hash = '#/stats'; }
     });
@@ -962,7 +1034,7 @@ function userActions(u) {
 }
 
 async function adminTopups() {
-  const list = await api('GET', '/api/admin/topups');
+  const list = await api('GET', withDept('/api/admin/topups'));
   const html = `<div class="card flush">${list.length ? `<ul class="list">${list.map((t) => `<li style="cursor:default">
       <div class="avatar">${initial(t.display_name)}</div>
       <div class="main"><div class="t">${esc(t.display_name)} <span class="num">${money(t.cents, { sign: true })}</span></div>
@@ -988,7 +1060,7 @@ async function adminAudit() {
   const q = new URLSearchParams();
   if (f.userId) q.set('user_id', f.userId);
   if (f.others) q.set('others', '1');
-  const [users, rows] = await Promise.all([api('GET', '/api/admin/users'), api('GET', '/api/admin/audit?' + q)]);
+  const [users, rows] = await Promise.all([api('GET', withDept('/api/admin/users')), api('GET', withDept('/api/admin/audit?' + q))]);
   const html = `<div class="card">
       <div class="field"><select id="au"><option value="">所有人</option>${users.map((u) => `<option value="${u.id}" ${String(u.id) === f.userId ? 'selected' : ''}>${esc(u.displayName)}</option>`).join('')}</select></div>
       <label class="check"><input type="checkbox" id="ao" ${f.others ? 'checked' : ''}> 只看动了别人账户的操作</label>
@@ -1009,7 +1081,7 @@ async function adminExpenses() {
   if (!f.to) f.to = me.today;
   const q = new URLSearchParams({ from: f.from, to: f.to });
   if (f.userId) q.set('user_id', f.userId);
-  const [users, rows] = await Promise.all([api('GET', '/api/admin/users'), api('GET', '/api/admin/expenses?' + q)]);
+  const [users, rows] = await Promise.all([api('GET', withDept('/api/admin/users')), api('GET', withDept('/api/admin/expenses?' + q))]);
   const total = rows.reduce((a, r) => a + r.cents, 0);
   const days = [];
   for (const r of rows) {
