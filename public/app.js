@@ -250,6 +250,19 @@ function heroCard(monthCents) {
 }
 function bindGo(root = $app) { root.querySelectorAll('[data-go]').forEach((b) => b.onclick = () => { location.hash = b.dataset.go; }); }
 
+// ---------- 首页合买入口 ----------
+// 有人等我表态时高亮 + 红色角标；否则显示进行中的个数或一句说明
+function splitEntry() {
+  const todo = me.splitTodo || 0, open = me.splitOpen || 0;
+  const sub = todo ? '点进来同意或拒绝' : open ? `进行中 ${open} 个，点进来看看` : '和大家一起买西瓜、水果，按人数平分';
+  return `<button class="split-entry ${todo ? 'todo' : ''}" data-go="#/split">
+    <span class="meal-icon" style="--m: var(--m-other)">${icon('fruit')}</span>
+    <span class="main"><b>${todo ? `有 ${todo} 个合买等你回应` : '合买'}</b><small>${sub}</small></span>
+    ${todo ? `<span class="badge count">${todo}</span>` : `<span class="go">${open ? '查看' : '发起'}</span>`}
+    ${icon('chev', 'chev')}
+  </button>`;
+}
+
 // ---------- 记账（首页） ----------
 let suggestCache = null;
 async function renderHome() {
@@ -285,6 +298,7 @@ async function renderHome() {
     <header class="top"><div><div class="hello">${greeting()}${me.deptCount > 1 ? ' · ' + esc(me.dept.name) : ''}</div><div class="title">${esc(me.user.displayName)}</div></div>
       <div class="right">${md(me.today)}<br>周${WEEK[dow(me.today)]}</div></header>
     ${heroCard(stats.monthCents)}
+    ${splitEntry()}
     <div class="daybar">
       <div class="seg">
         <button data-day="${me.today}" class="${state.day === me.today ? 'on' : ''}">今天</button>
@@ -297,14 +311,9 @@ async function renderHome() {
       <div class="meal-icon" style="--m: var(--accent)">${icon('plus')}</div>
       <div><b>怎么记账</b><div class="small">吃完饭点一下对应的餐次，输入花了多少钱就行。记下后会自动从你的余额里扣。</div></div>
       <button class="hint-x" id="hint-x" aria-label="知道了">知道了</button></div>` : ''}
-    ${me.splitTodo ? `<div class="hint" data-go="#/split" style="cursor:pointer">
-      <div class="meal-icon" style="--m: var(--m-other)">${icon('fruit')}</div>
-      <div><b>有 ${me.splitTodo} 个合买等你回应</b><div class="small">点这里看看，同意或拒绝</div></div>
-      ${icon('chev', 'chev')}</div>` : ''}
     ${mealsHtml}
     ${editable ? `<button class="btn soft block" data-add="other" style="margin-top:2px">${icon('plus')} 其他（零食、饮料…）</button>`
-      : `<div class="locked">${icon('lock')}这一天已锁定，如需修改请联系管理员</div>`}
-    <button class="btn soft block" data-go="#/split" style="margin-top:10px">${icon('fruit')} 合买（大家一起买西瓜、水果…）</button>`);
+      : `<div class="locked">${icon('lock')}这一天已锁定，如需修改请联系管理员</div>`}`);
   { const el = document.getElementById('hero-today'); el.innerHTML = countSpan(stats.todayCents, 'today'); animateCounts(el); }
   bindGo();
 

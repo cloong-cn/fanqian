@@ -292,15 +292,16 @@ route('POST', '/api/logout', async ({ req, res }) => {
 
 route('GET', '/api/me', async ({ user }) => {
   const today = todayStr();
-  const [dept, deptCount, todayAll, bal, splitTodo] = await Promise.all([
+  const [dept, deptCount, todayAll, bal, split] = await Promise.all([
     cached('dept:' + user.dept_id, async () => (await db.query(`SELECT id, name, members_visible FROM departments WHERE id=$1`, [user.dept_id])).rows[0]),
     cached('deptCount', async () => Number((await db.query(`SELECT COUNT(*) AS n FROM departments WHERE deleted_at IS NULL`)).rows[0].n)),
     cached(`today:${user.dept_id}:${today}`, async () => Number((await db.query(`SELECT COALESCE(SUM(e.cents),0) AS c FROM expenses e
       JOIN users u ON u.id=e.user_id WHERE e.day=$1 AND u.dept_id=$2`, [today, user.dept_id])).rows[0].c)),
     balances(user.id),
-    // 等我表态的合买有几个（首页提醒用）
-    db.query(`SELECT COUNT(*)::int AS n FROM split_members m JOIN splits s ON s.id=m.split_id
-      WHERE m.user_id=$1 AND m.status='pending' AND s.status='open'`, [user.id]).then((r) => r.rows[0].n),
+    // 首页合买入口用：todo=等我表态的个数，open=和我有关的进行中合买个数
+    db.query(`SELECT COUNT(*) FILTER (WHERE m.status='pending')::int AS todo, COUNT(*)::int AS open
+      FROM splits s LEFT JOIN split_members m ON m.split_id=s.id AND m.user_id=$1
+      WHERE s.status='open' AND (s.creator_id=$1 OR m.user_id IS NOT NULL)`, [user.id]).then((r) => r.rows[0]),
   ]);
   return {
     user: { id: user.id, username: user.username, displayName: user.display_name, isAdmin: user.is_admin, isSuper: user.is_super },
@@ -309,7 +310,8 @@ route('GET', '/api/me', async ({ user }) => {
     today,
     lowBalanceCents: LOW_BALANCE_CENTS,
     todayAllCents: todayAll,
-    splitTodo,
+    splitTodo: split.todo,
+    splitOpen: split.open,
     ...bal,
   };
 });

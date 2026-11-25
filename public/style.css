@@ -569,3 +569,20 @@ input.switch:focus { border: 0; }
 .chip.pick.on { background: var(--accent-soft); border-color: var(--accent); color: var(--accent); font-weight: 600; }
 .chip .badge { margin-left: 2px; }
 .hint .chev { color: var(--faint); width: 16px; height: 16px; flex: none; margin-left: auto; align-self: center; }
+/* 首页合买入口：放在余额卡片下面，和餐次卡片区分开 */
+.split-entry {
+  display: flex; align-items: center; gap: 12px; width: 100%; text-align: left; cursor: pointer; font: inherit; color: var(--text);
+  background: color-mix(in srgb, var(--m-other) 10%, var(--card)); border: 1px solid color-mix(in srgb, var(--m-other) 35%, var(--line));
+  border-radius: var(--r-lg); padding: 13px 14px; margin: 0 0 14px; box-shadow: var(--shadow);
+  transition: transform .12s var(--ease-out), background .2s;
+}
+.split-entry:active { transform: scale(.98); }
+.split-entry .meal-icon { width: 40px; height: 40px; border-radius: 13px; background: color-mix(in srgb, var(--m-other) 22%, transparent); }
+.split-entry .meal-icon svg { width: 22px; height: 22px; }
+.split-entry .main { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+.split-entry b { font-size: 15.5px; font-weight: 600; }
+.split-entry small { font-size: 12.5px; color: var(--muted); margin-top: 1px; }
+.split-entry .go { font-size: 13px; font-weight: 600; color: var(--m-other); }
+.split-entry .chev { width: 16px; height: 16px; color: var(--faint); flex: none; }
+.split-entry.todo { background: var(--warn-soft); border-color: color-mix(in srgb, var(--warn) 45%, transparent); }
+.split-entry.todo b { color: var(--warn); }

@@ -422,6 +422,8 @@ sec('合买：发起 / 表态 / 自动结算 / 四舍五入 / 权限');
   let sp = await find(U, c1.d.id);
   ok(sp.status === 'open' && sp.members.length === 3 && sp.myStatus === 'agreed' && sp.canManage, 'creator auto-agreed, deduped, can manage', JSON.stringify(sp));
   ok((await S1.get('/api/me')).d.splitTodo >= 1, 'member sees todo count');
+  { const m = (await U.get('/api/me')).d; ok(m.splitOpen === 1 && m.splitTodo === 0, 'creator: 1 open, nothing to answer', JSON.stringify([m.splitOpen, m.splitTodo])); }
+  ok((await S1.get('/api/me')).d.splitOpen === 1, 'member open count');
   ok(!(await find(S3, c1.d.id)), 'non-member cannot see split');
   ok((await S3.post(`/api/splits/${c1.d.id}/respond`, { agree: true })).s === 404, 'non-member cannot respond');
   ok((await S1.post(`/api/splits/${c1.d.id}/settle`)).s === 404, 'member (not creator) cannot settle');

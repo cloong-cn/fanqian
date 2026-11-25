@@ -28,9 +28,9 @@ PostgreSQL（库 cw，表结构见 schema.sql）
 | 部署、备份 | `deploy/`（systemd、nginx 示例、`backup.sh`） |
 | 测试 | `tests/api.test.mjs` |
 
-`server.js` 的分区顺序：事务 → 读缓存 → 工具 → 余额 → 会话 → 业务规则 → 操作日志 → 部门范围 → 路由与各接口 → 管理员 → 部门 → 日志查询 → 静态文件 → 服务。
+`server.js` 的分区顺序：事务 → 读缓存 → 工具 → 余额 → 会话 → 业务规则 → 操作日志 → 部门范围 → 路由与各接口 → 合买 → 管理员 → 部门 → 日志查询 → 静态文件 → 服务。
 
-`public/app.js` 的页面和网址：`#/` 记账（`renderHome`）、`#/bill` 账单（`renderBill`，里面分 `renderHistory` 明细和 `renderStats` 统计）、`#/topup` 充值、`#/me` 我的、`#/log` 我的账户变动、`#/admin` 管理（`adminUsers` / `adminTopups` / `adminExpenses` / `adminAudit` / `adminDepts`）。路由表在文件最后。
+`public/app.js` 的页面和网址：`#/` 记账（`renderHome`）、`#/bill` 账单（`renderBill`，里面分 `renderHistory` 明细和 `renderStats` 统计）、`#/topup` 充值、`#/split` 合买（`renderSplit` / `newSplitSheet`，首页入口是 `splitEntry()`）、`#/me` 我的、`#/log` 我的账户变动、`#/admin` 管理（`adminUsers` / `adminTopups` / `adminExpenses` / `adminAudit` / `adminDepts`）。路由表在文件最后。
 
 ## 不能破坏的规则（数据正确性）
 
