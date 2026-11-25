@@ -6,7 +6,8 @@
 - 代码：`/srv/cw/app`（就是本仓库），系统用户 `cw`
 - 服务：`systemctl restart cw`（`/etc/systemd/system/cw.service`，监听 127.0.0.1:8790）
 - 数据库：本机 PG 15，库 `cw`，unix socket + peer 认证（无密码）
-- Nginx：`/etc/nginx/conf.d/cw.conf`
+- Nginx：`/etc/nginx/conf.d/cw.conf`（CSP 里放行了 umami.example.com）
+- 访问统计：umami 网站 ID `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`，脚本在 `public/index.html`，按页面虚拟路径上报（`trackPage()`），不含任何金额/姓名
 - 备份：`cw-backup.timer` 每天 03:30 → `/srv/cw/backups`
 
 ## 改代码的流程
