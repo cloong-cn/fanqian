@@ -120,3 +120,13 @@ public/        前端（index.html、app.js、style.css、图标、Service Worke
 deploy/        systemd、Nginx 示例配置、备份脚本
 tests/         接口测试
 ```
+
+## 许可
+
+Copyright (C) 2026 [cloong-cn](https://github.com/cloong-cn)
+
+本项目以 [GNU AGPL-3.0](LICENSE) 许可发布。简单说：
+
+- 可以免费使用、修改、自己部署
+- 再分发或修改时，必须保留原作者署名和本许可
+- 修改后的版本无论是分发给别人，还是部署成网站给别人用，都必须以同样的许可公开完整源码
