@@ -397,4 +397,99 @@ sec('成员互相查看 + 缓存一致性');
   await S.del('/api/admin/depts/' + dv);
 }
 
+sec('合买：发起 / 表态 / 自动结算 / 四舍五入 / 权限');
+{
+  const dx = (await A.post('/api/admin/depts', { name: 'zz合买外部门' })).d.id;
+  const mk = async (u, dept) => { const r = await A.post('/api/admin/users', { username: u, displayName: '测' + u, password: 'pppppp', ...(dept ? { deptId: dept } : {}) }); const c = new C(); await c.login(u, 'pppppp'); return [r.d.id, c]; };
+  const [s1, S1] = await mk('zzs1'), [s2, S2] = await mk('zzs2'), [s3, S3] = await mk('zzs3'), [sx, SX] = await mk('zzsx', dx);
+  const [uid, U] = await mk('zzs0');
+  for (const id of [uid, s1, s2, s3]) await A.post('/api/admin/topups', { userId: id, amount: '100' });
+  const bal = async (c) => (await c.get('/api/me')).d.balanceCents;
+  const find = async (c, id) => (await c.get('/api/splits')).d.find((x) => x.id === id);
+  const people = (await U.get('/api/splits/people')).d;
+  ok(people.some((p) => p.id === s1) && !people.some((p) => p.id === sx), 'people list = own dept only');
+
+  ok((await U.post('/api/splits', { item: '西瓜', amount: '10', members: [uid] })).s === 400, 'need >= 2 people');
+  ok((await U.post('/api/splits', { item: '', amount: '10', members: [uid, s1] })).s === 400, 'item required');
+  ok((await U.post('/api/splits', { item: '西瓜', amount: '0', members: [uid, s1] })).s === 400, 'amount must be > 0');
+  ok((await U.post('/api/splits', { item: '西瓜', amount: '0.01', members: [uid, s1] })).s === 400, 'amount < 1 cent per head rejected');
+  ok((await U.post('/api/splits', { item: '西瓜', amount: '10', members: [uid, sx] })).s === 400, 'cannot pick other dept user');
+
+  // 1) U 发起 10 元，U/S1/S2；S1 同意 S2 拒绝 → 自动结算，2 人各 5 元
+  let b = { u: await bal(U), s1: await bal(S1), s2: await bal(S2) };
+  const c1 = await U.post('/api/splits', { item: '西瓜', amount: '10', members: [uid, s1, s2, s1] });
+  ok(c1.s === 200, 'create split');
+  let sp = await find(U, c1.d.id);
+  ok(sp.status === 'open' && sp.members.length === 3 && sp.myStatus === 'agreed' && sp.canManage, 'creator auto-agreed, deduped, can manage', JSON.stringify(sp));
+  ok((await S1.get('/api/me')).d.splitTodo >= 1, 'member sees todo count');
+  ok(!(await find(S3, c1.d.id)), 'non-member cannot see split');
+  ok((await S3.post(`/api/splits/${c1.d.id}/respond`, { agree: true })).s === 404, 'non-member cannot respond');
+  ok((await S1.post(`/api/splits/${c1.d.id}/settle`)).s === 404, 'member (not creator) cannot settle');
+  ok((await S1.post(`/api/splits/${c1.d.id}/cancel`)).s === 404, 'member (not creator) cannot cancel');
+  ok((await SX.post(`/api/splits/${c1.d.id}/respond`, { agree: true })).s === 404, 'other dept cannot respond');
+  ok((await U.get('/api/me')).d.balanceCents === b.u, 'no charge before settle');
+  ok((await S1.post(`/api/splits/${c1.d.id}/respond`, { agree: true })).d.settled === false, 'S1 agree, not settled yet');
+  ok((await S1.post(`/api/splits/${c1.d.id}/respond`, { agree: false })).s === 200, 'can change mind while open');
+  await S1.post(`/api/splits/${c1.d.id}/respond`, { agree: true });
+  await A.post('/api/admin/topups', { userId: s2, setTo: '0' });
+  const del1 = await A.del('/api/admin/users/' + s2);
+  await A.post('/api/admin/topups', { userId: s2, setTo: '100' });
+  ok(del1.s === 400 && /合买/.test(del1.d.error || ''), 'cannot delete user with open split', JSON.stringify(del1.d));
+  ok((await S2.post(`/api/splits/${c1.d.id}/respond`, { agree: false })).d.settled === true, 'last response triggers settle');
+  ok(await bal(U) === b.u - 500 && await bal(S1) === b.s1 - 500 && await bal(S2) === b.s2, 'agreed pay 5 each, decliner pays 0');
+  sp = await find(S1, c1.d.id);
+  ok(sp.status === 'settled' && sp.members.find((m) => m.id === s1).cents === 500 && !sp.canManage, 'settled with cents recorded');
+  ok((await S2.post(`/api/splits/${c1.d.id}/respond`, { agree: true })).s === 400, 'cannot respond after settle');
+  ok((await U.post(`/api/splits/${c1.d.id}/cancel`)).s === 400, 'cannot cancel after settle');
+  const ex = (await S1.get('/api/day')).d.items.find((x) => x.splitId === c1.d.id);
+  ok(ex && ex.meal === 'other' && ex.item === '合买·西瓜' && ex.cents === 500, 'expense row linked to split', JSON.stringify(ex));
+  ok((await S1.put('/api/expenses/' + ex.id, { amount: '1' })).s === 403, 'user cannot edit split expense');
+  ok((await S1.del('/api/expenses/' + ex.id)).s === 403, 'user cannot delete split expense');
+  ok((await A.put('/api/expenses/' + ex.id, { amount: '5' })).s === 200, 'admin can still correct split expense');
+  ok((await S1.get('/api/audit/mine')).d.some((r) => r.action === 'split.charge'), 'charge shows in member\'s account log');
+
+  // 2) 10 元 3 人都同意：333 / 333 / 发起人 334
+  b = { u: await bal(U), s1: await bal(S1), s2: await bal(S2) };
+  const c2 = (await U.post('/api/splits', { item: '葡萄', amount: '10', members: [uid, s1, s2] })).d.id;
+  await S1.post(`/api/splits/${c2}/respond`, { agree: true }); await S2.post(`/api/splits/${c2}/respond`, { agree: true });
+  ok(await bal(S1) === b.s1 - 333 && await bal(S2) === b.s2 - 333 && await bal(U) === b.u - 334, 'rounded to cent, creator covers remainder');
+
+  // 3) 发起人不参加：S1 发起 10 元给 U/S2/S3，尾差由最早同意的人补
+  b = { u: await bal(U), s1: await bal(S1), s2: await bal(S2), s3: await bal(S3) };
+  const c3 = (await S1.post('/api/splits', { item: '苹果', amount: '10', members: [uid, s2, s3] })).d.id;
+  ok((await find(S1, c3)).myStatus === null, 'creator not a member when unchecked');
+  await S2.post(`/api/splits/${c3}/respond`, { agree: true }); await U.post(`/api/splits/${c3}/respond`, { agree: true }); await S3.post(`/api/splits/${c3}/respond`, { agree: true });
+  ok(await bal(S1) === b.s1 && await bal(S2) === b.s2 - 334 && await bal(U) === b.u - 333 && await bal(S3) === b.s3 - 333, 'first agreer covers remainder when creator not in');
+
+  // 4) 四舍五入：0.05 元 2 人 → 非补齐的人 round(2.5)=3 分，发起人 2 分
+  b = { u: await bal(U), s1: await bal(S1) };
+  const c4 = (await U.post('/api/splits', { item: '橘子', amount: '0.05', members: [uid, s1] })).d.id;
+  await S1.post(`/api/splits/${c4}/respond`, { agree: true });
+  ok(await bal(S1) === b.s1 - 3 && await bal(U) === b.u - 2, 'half rounds up (2.5 -> 3)');
+
+  // 5) 提前结算：没表态的人不扣
+  b = { u: await bal(U), s1: await bal(S1), s2: await bal(S2) };
+  const c5 = (await U.post('/api/splits', { item: '香蕉', amount: '1', members: [uid, s1, s2] })).d.id;
+  await S1.post(`/api/splits/${c5}/respond`, { agree: true });
+  ok((await U.post(`/api/splits/${c5}/settle`)).s === 200, 'creator settles early');
+  ok(await bal(U) === b.u - 50 && await bal(S1) === b.s1 - 50 && await bal(S2) === b.s2, 'early settle: pending member not charged');
+  ok((await find(S2, c5)).members.find((m) => m.id === s2).status === 'pending', 'pending member stays pending (shown 未参加)');
+
+  // 6) 取消 / 全部拒绝 / 管理员
+  b = { u: await bal(U), s1: await bal(S1) };
+  const c6 = (await U.post('/api/splits', { item: '榴莲', amount: '80', members: [uid, s1] })).d.id;
+  ok((await U.post(`/api/splits/${c6}/cancel`)).s === 200, 'creator cancels');
+  ok((await S1.post(`/api/splits/${c6}/respond`, { agree: true })).s === 400, 'cannot respond to cancelled');
+  const c7 = (await S1.post('/api/splits', { item: '芒果', amount: '20', members: [uid, s2] })).d.id;
+  await U.post(`/api/splits/${c7}/respond`, { agree: false });
+  ok((await S2.post(`/api/splits/${c7}/respond`, { agree: false })).d.settled === true && (await find(S1, c7)).status === 'cancelled', 'all declined -> cancelled');
+  const c8 = (await S1.post('/api/splits', { item: '桃子', amount: '20', members: [s1, s2] })).d.id;
+  ok((await A.get('/api/splits')).d.some((x) => x.id === c8 && x.canManage), 'admin sees dept splits and can manage');
+  ok((await A.post(`/api/splits/${c8}/cancel`)).s === 200, 'admin cancels');
+  ok(await bal(U) === b.u && await bal(S1) === b.s1, 'cancel / all-declined charge nothing');
+  ok((await S1.get('/api/me')).d.splitTodo === 0, 'todo count back to 0');
+
+  for (const id of [uid, s1, s2, s3]) await A.post('/api/admin/topups', { userId: id, setTo: '0' });
+}
+
 console.log(`\n通过 ${pass} 项，失败 ${failN} 项`);

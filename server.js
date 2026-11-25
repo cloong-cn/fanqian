@@ -182,10 +182,10 @@ function canEditDay(user, day) {
 }
 function rowExpense(r) {
   return { id: r.id, userId: r.user_id, day: r.day, meal: r.meal, item: r.item, cents: r.cents,
-    time: r.time || null, adminEdited: !!r.admin_edited };
+    time: r.time || null, adminEdited: !!r.admin_edited, splitId: r.split_id || null };
 }
 // 查询消费记录时统一取的列
-const EXP_COLS = `id,user_id,to_char(day,'YYYY-MM-DD') AS day,meal,item,cents,admin_edited,
+const EXP_COLS = `id,user_id,to_char(day,'YYYY-MM-DD') AS day,meal,item,cents,admin_edited,split_id,
   to_char(created_at AT TIME ZONE '${TZ}','HH24:MI') AS time`;
 
 // ---------- 操作日志 ----------
@@ -292,12 +292,15 @@ route('POST', '/api/logout', async ({ req, res }) => {
 
 route('GET', '/api/me', async ({ user }) => {
   const today = todayStr();
-  const [dept, deptCount, todayAll, bal] = await Promise.all([
+  const [dept, deptCount, todayAll, bal, splitTodo] = await Promise.all([
     cached('dept:' + user.dept_id, async () => (await db.query(`SELECT id, name, members_visible FROM departments WHERE id=$1`, [user.dept_id])).rows[0]),
     cached('deptCount', async () => Number((await db.query(`SELECT COUNT(*) AS n FROM departments WHERE deleted_at IS NULL`)).rows[0].n)),
     cached(`today:${user.dept_id}:${today}`, async () => Number((await db.query(`SELECT COALESCE(SUM(e.cents),0) AS c FROM expenses e
       JOIN users u ON u.id=e.user_id WHERE e.day=$1 AND u.dept_id=$2`, [today, user.dept_id])).rows[0].c)),
     balances(user.id),
+    // 等我表态的合买有几个（首页提醒用）
+    db.query(`SELECT COUNT(*)::int AS n FROM split_members m JOIN splits s ON s.id=m.split_id
+      WHERE m.user_id=$1 AND m.status='pending' AND s.status='open'`, [user.id]).then((r) => r.rows[0].n),
   ]);
   return {
     user: { id: user.id, username: user.username, displayName: user.display_name, isAdmin: user.is_admin, isSuper: user.is_super },
@@ -306,6 +309,7 @@ route('GET', '/api/me', async ({ user }) => {
     today,
     lowBalanceCents: LOW_BALANCE_CENTS,
     todayAllCents: todayAll,
+    splitTodo,
     ...bal,
   };
 });
@@ -374,6 +378,8 @@ async function loadOwnExpense(user, id) {
     await userInScope(user, r.user_id).catch(() => { throw new HttpError(404, '记录不存在'); });
   }
   if (!canEditDay(user, r.day)) throw new HttpError(403, '这条记录太早了，不能再修改，请联系管理员');
+  // 合买的扣款是大家一起定的，普通用户不能自己改（管理员可以纠错）
+  if (r.split_id && !user.is_admin) throw new HttpError(403, '这是合买的扣款，不能自己修改，请联系管理员');
   return r;
 }
 
@@ -670,6 +676,139 @@ route('DELETE', '/api/topups/:id', async ({ user, params }) => {
   return { ok: true };
 });
 
+// ---------- 合买 ----------
+// 规则见 schema.sql 里 splits 表的注释。金额只在结算时一次性算好、记成消费，之后余额照常现算。
+const SPLIT_STATUS_CN = { open: '进行中', settled: '已结算', cancelled: '已取消' };
+// 平分：每人 round(总价/人数)，补齐的人出"总价 − 其他人之和"。人多钱少到补齐的人出不到 1 分时改用向下取整
+function splitShares(total, ids, payerId) {
+  const n = ids.length;
+  let base = Math.round(total / n);
+  if (total - base * (n - 1) <= 0) base = Math.floor(total / n);
+  return new Map(ids.map((id) => [id, id === payerId ? total - base * (n - 1) : base]));
+}
+async function loadSplit(id, { lock = false } = {}) {
+  const { rows: [s] } = await db.query(`SELECT id, dept_id, creator_id, item, total_cents, status,
+    to_char(day,'YYYY-MM-DD') AS day FROM splits WHERE id=$1 ${lock ? 'FOR UPDATE' : ''}`, [id]);
+  return s;
+}
+// 发起人或本部门管理员（总管理员不限部门）可以结算 / 取消
+const canManageSplit = (user, s) => s.creator_id === user.id || (user.is_admin && (user.is_super || s.dept_id === user.dept_id));
+// 结算：调用前必须已经 FOR UPDATE 锁住这一行，保证不会结算两次
+async function settleSplit(s, actorId) {
+  const { rows: ms } = await db.query(`SELECT user_id, status FROM split_members WHERE split_id=$1
+    ORDER BY responded_at NULLS LAST, user_id`, [s.id]);
+  const agreed = ms.filter((m) => m.status === 'agreed').map((m) => m.user_id);
+  if (!agreed.length) {
+    await db.query(`UPDATE splits SET status='cancelled', closed_at=now(), closed_by=$2 WHERE id=$1`, [s.id, actorId]);
+    await audit(db, actorId, s.creator_id, 'split.cancel', `合买「${s.item}」${fmtY(s.total_cents)} 没有人同意，自动取消`);
+    return;
+  }
+  const payer = agreed.includes(s.creator_id) ? s.creator_id : agreed[0];
+  const shares = splitShares(s.total_cents, agreed, payer);
+  const item = cleanText('合买·' + s.item, 40);
+  for (const [uid, cents] of shares) {
+    await db.query(`INSERT INTO expenses(user_id,day,meal,item,cents,split_id) VALUES($1,$2,'other',$3,$4,$5)`,
+      [uid, s.day, item, cents, s.id]);
+    await db.query(`UPDATE split_members SET cents=$3 WHERE split_id=$1 AND user_id=$2`, [s.id, uid, cents]);
+    await audit(db, actorId, uid, 'split.charge',
+      `合买「${s.item}」共 ${fmtY(s.total_cents)}，${agreed.length} 人分摊，扣 ${fmtY(cents)}${uid === payer && agreed.length > 1 ? '（含补齐尾差）' : ''}`,
+      { splitId: s.id, cents });
+  }
+  await db.query(`UPDATE splits SET status='settled', closed_at=now(), closed_by=$2 WHERE id=$1`, [s.id, actorId]);
+}
+
+// 能选的人：本部门所有正常账号（只给名字）
+route('GET', '/api/splits/people', async ({ user }) => {
+  const { rows } = await db.query(`SELECT id, display_name FROM users
+    WHERE dept_id=$1 AND NOT disabled AND deleted_at IS NULL ORDER BY id`, [user.dept_id]);
+  return rows.map((r) => ({ id: r.id, name: r.display_name }));
+});
+
+// 列表：普通用户看自己发起或被选中的；管理员看整个部门。进行中的排前面
+route('GET', '/api/splits', async ({ user, query }) => {
+  const args = [];
+  let where;
+  if (user.is_admin) { args.push(await adminDept(user, query.get('dept'))); where = 's.dept_id=$1'; }
+  else { args.push(user.id); where = 's.creator_id=$1 OR EXISTS (SELECT 1 FROM split_members m WHERE m.split_id=s.id AND m.user_id=$1)'; }
+  const { rows: ss } = await db.query(`SELECT s.*, to_char(s.day,'YYYY-MM-DD') AS dday, u.display_name AS creator_name
+    FROM splits s JOIN users u ON u.id=s.creator_id WHERE ${where}
+    ORDER BY s.status='open' DESC, s.id DESC LIMIT 60`, args);
+  const { rows: ms } = ss.length ? await db.query(`SELECT m.split_id, m.user_id, m.status, m.cents, u.display_name
+    FROM split_members m JOIN users u ON u.id=m.user_id WHERE m.split_id = ANY($1::int[])
+    ORDER BY m.responded_at NULLS LAST, m.user_id`, [ss.map((s) => s.id)]) : { rows: [] };
+  return ss.map((s) => {
+    const members = ms.filter((m) => m.split_id === s.id)
+      .map((m) => ({ id: m.user_id, name: m.display_name, status: m.status, cents: m.cents }));
+    const mine = members.find((m) => m.id === user.id);
+    return {
+      id: s.id, item: s.item, totalCents: s.total_cents, day: s.dday, status: s.status,
+      createdAt: s.created_at, closedAt: s.closed_at,
+      creator: { id: s.creator_id, name: s.creator_name }, members,
+      myStatus: mine ? mine.status : null, canManage: s.status === 'open' && canManageSplit(user, s),
+    };
+  });
+});
+
+route('POST', '/api/splits', async ({ user, body }) => {
+  const item = cleanText(body.item, 20);
+  if (!item) throw bad('请填写买的是什么');
+  const total = parseAmount(body.amount);
+  if (!total) throw bad('金额不对');
+  const ids = [...new Set((Array.isArray(body.members) ? body.members : []).map(Number))]
+    .filter((n) => Number.isInteger(n) && n > 0 && n < 2147483647);
+  if (ids.length < 2) throw bad('至少选 2 个人一起分摊');
+  if (ids.length > 100) throw bad('人太多了');
+  if (total < ids.length) throw bad('金额太少，不够每人 1 分钱');
+  const { rows: ok } = await db.query(`SELECT id FROM users WHERE id = ANY($1::int[]) AND dept_id=$2
+    AND NOT disabled AND deleted_at IS NULL`, [ids, user.dept_id]);
+  if (ok.length !== ids.length) throw bad('选的人里有不在本部门或已停用的账号');
+  const { rows: [c] } = await db.query(`SELECT COUNT(*)::int AS n FROM splits WHERE creator_id=$1 AND status='open'`, [user.id]);
+  if (c.n >= 10) throw bad('你已经有 10 个进行中的合买，先结算一些吧');
+  const { rows: [s] } = await db.query(`INSERT INTO splits(dept_id,creator_id,item,total_cents,day)
+    VALUES($1,$2,$3,$4,$5) RETURNING id`, [user.dept_id, user.id, item, total, todayStr()]);
+  // 发起人自己在名单里就直接算同意
+  for (const id of ids) {
+    const self = id === user.id;
+    await db.query(`INSERT INTO split_members(split_id,user_id,status,responded_at) VALUES($1,$2,$3,$4)`,
+      [s.id, id, self ? 'agreed' : 'pending', self ? new Date() : null]);
+  }
+  await audit(db, user.id, user.id, 'split.create',
+    `发起合买「${item}」${fmtY(total)}，选了 ${ids.length} 人${ids.includes(user.id) ? '（含自己）' : '（自己不参加）'}`, { splitId: s.id, members: ids });
+  return { id: s.id };
+});
+
+// 被选中的人表态：同意 / 拒绝。结算前可以改主意；所有人都表态完就自动结算
+route('POST', '/api/splits/:id/respond', async ({ user, params, body }) => {
+  const s = await loadSplit(params.id, { lock: true });
+  const { rows: [m] } = s ? await db.query(`SELECT status FROM split_members WHERE split_id=$1 AND user_id=$2`, [s.id, user.id]) : { rows: [] };
+  if (!m) throw new HttpError(404, '找不到这个合买');
+  if (s.status !== 'open') throw bad(`这个合买${SPLIT_STATUS_CN[s.status]}，不能再改了`);
+  const st = body.agree ? 'agreed' : 'declined';
+  await db.query(`UPDATE split_members SET status=$3, responded_at=now() WHERE split_id=$1 AND user_id=$2`, [s.id, user.id, st]);
+  if (m.status !== st) await audit(db, user.id, user.id, 'split.respond', `${st === 'agreed' ? '同意' : '拒绝'}参加合买「${s.item}」${fmtY(s.total_cents)}`, { splitId: s.id });
+  const { rows: [left] } = await db.query(`SELECT COUNT(*)::int AS n FROM split_members WHERE split_id=$1 AND status='pending'`, [s.id]);
+  if (left.n === 0) await settleSplit(s, user.id);
+  return { ok: true, settled: left.n === 0 };
+});
+
+// 提前结算：还没表态的人算不参加
+route('POST', '/api/splits/:id/settle', async ({ user, params }) => {
+  const s = await loadSplit(params.id, { lock: true });
+  if (!s || !canManageSplit(user, s)) throw new HttpError(404, '找不到这个合买');
+  if (s.status !== 'open') throw bad(`这个合买${SPLIT_STATUS_CN[s.status]}了`);
+  await settleSplit(s, user.id);
+  return { ok: true };
+});
+
+route('POST', '/api/splits/:id/cancel', async ({ user, params }) => {
+  const s = await loadSplit(params.id, { lock: true });
+  if (!s || !canManageSplit(user, s)) throw new HttpError(404, '找不到这个合买');
+  if (s.status !== 'open') throw bad(`这个合买${SPLIT_STATUS_CN[s.status]}了`);
+  await db.query(`UPDATE splits SET status='cancelled', closed_at=now(), closed_by=$2 WHERE id=$1`, [s.id, user.id]);
+  await audit(db, user.id, s.creator_id, 'split.cancel', `取消合买「${s.item}」${fmtY(s.total_cents)}`, { splitId: s.id });
+  return { ok: true };
+});
+
 // ---------- 管理员 ----------
 route('GET', '/api/admin/users', async ({ user, query }) => {
   const dept = await adminDept(user, query.get('dept'));
@@ -826,7 +965,7 @@ route('GET', '/api/admin/expenses', async ({ user, query }) => {
   const args = [from, to, await adminDept(user, query.get('dept'))]; let extra = ' AND u.dept_id=$3';
   if (query.get('user_id')) { args.push(Number(query.get('user_id')) || 0); extra += ` AND e.user_id=$4`; }
   const { rows } = await db.query(`
-    SELECT e.id,e.user_id,u.display_name,to_char(e.day,'YYYY-MM-DD') AS day,e.meal,e.item,e.cents,e.admin_edited,
+    SELECT e.id,e.user_id,u.display_name,to_char(e.day,'YYYY-MM-DD') AS day,e.meal,e.item,e.cents,e.admin_edited,e.split_id,
       to_char(e.created_at AT TIME ZONE '${TZ}','HH24:MI') AS time
     FROM expenses e JOIN users u ON u.id=e.user_id
     WHERE e.day >= $1 AND e.day <= $2 ${extra}
@@ -889,7 +1028,9 @@ async function notDeletableReason(ids) {
     SELECT u.display_name, u.is_super,
       COALESCE((SELECT SUM(cents) FROM topups t WHERE t.user_id=u.id AND status='done'),0)
         - COALESCE((SELECT SUM(cents) FROM expenses e WHERE e.user_id=u.id),0) AS bal,
-      EXISTS (SELECT 1 FROM topups t WHERE t.user_id=u.id AND status='pending') AS pending
+      EXISTS (SELECT 1 FROM topups t WHERE t.user_id=u.id AND status='pending') AS pending,
+      EXISTS (SELECT 1 FROM splits s WHERE s.status='open' AND (s.creator_id=u.id
+        OR EXISTS (SELECT 1 FROM split_members m WHERE m.split_id=s.id AND m.user_id=u.id AND m.status<>'declined'))) AS in_split
     FROM users u WHERE u.id = ANY($1::int[]) ORDER BY u.id FOR UPDATE OF u`, [ids]);
   const sup = rows.filter((r) => r.is_super);
   if (sup.length) return `${sup.map((r) => r.display_name).join('、')} 是总管理员，不能删除`;
@@ -897,6 +1038,8 @@ async function notDeletableReason(ids) {
   if (money.length) return `${money.map((r) => `${r.display_name}（余额 ${fmtY(Number(r.bal))}）`).join('、')} 余额不是 0，请先把余额设为 0 再删除`;
   const pend = rows.filter((r) => r.pending);
   if (pend.length) return `${pend.map((r) => r.display_name).join('、')} 还有待确认的充值，请先处理`;
+  const sp = rows.filter((r) => r.in_split);
+  if (sp.length) return `${sp.map((r) => r.display_name).join('、')} 还有进行中的合买，请先结算或取消`;
   return null;
 }
 

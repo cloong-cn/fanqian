@@ -564,3 +564,8 @@ input.switch:focus { border: 0; }
 .deleted-box[open] > summary::before { content: '▾ '; }
 .deleted-box > .card { margin-top: 8px; }
 .avatar.off { opacity: .45; filter: grayscale(1); }
+
+/* ========== 合买 ========== */
+.chip.pick.on { background: var(--accent-soft); border-color: var(--accent); color: var(--accent); font-weight: 600; }
+.chip .badge { margin-left: 2px; }
+.hint .chev { color: var(--faint); width: 16px; height: 16px; flex: none; margin-left: auto; align-self: center; }

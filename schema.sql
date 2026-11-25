@@ -90,3 +90,32 @@ ALTER TABLE departments ADD COLUMN IF NOT EXISTS members_visible boolean NOT NUL
 ALTER TABLE users ADD COLUMN IF NOT EXISTS deleted_at timestamptz;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS deleted_with_dept boolean NOT NULL DEFAULT false;
 ALTER TABLE departments ADD COLUMN IF NOT EXISTS deleted_at timestamptz;
+
+-- 合买（比如几个人一起买个西瓜）：发起人选人，被选的人同意/拒绝，全部表态完（或发起人提前结算）后
+-- 按"同意的人数"平分，四舍五入到分，尾差由发起人补齐（发起人没参加则由最早同意的人补齐）。
+-- 结算时给每个同意的人各记一条 meal='other' 的消费，expenses.split_id 指回这里。
+-- status: open=进行中, settled=已结算, cancelled=已取消（含没人同意）
+CREATE TABLE IF NOT EXISTS splits (
+  id          serial PRIMARY KEY,
+  dept_id     int  NOT NULL REFERENCES departments(id),
+  creator_id  int  NOT NULL REFERENCES users(id),
+  item        text NOT NULL,
+  total_cents int  NOT NULL CHECK (total_cents > 0),
+  day         date NOT NULL,
+  status      text NOT NULL DEFAULT 'open' CHECK (status IN ('open','settled','cancelled')),
+  created_at  timestamptz NOT NULL DEFAULT now(),
+  closed_at   timestamptz,
+  closed_by   int REFERENCES users(id)
+);
+CREATE INDEX IF NOT EXISTS splits_dept ON splits(dept_id, id DESC);
+-- 每个被选的人一行。status: pending=还没表态, agreed=同意, declined=拒绝；cents=结算后实际扣的钱
+CREATE TABLE IF NOT EXISTS split_members (
+  split_id     int  NOT NULL REFERENCES splits(id),
+  user_id      int  NOT NULL REFERENCES users(id),
+  status       text NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','agreed','declined')),
+  responded_at timestamptz,
+  cents        int,
+  PRIMARY KEY (split_id, user_id)
+);
+CREATE INDEX IF NOT EXISTS split_members_user ON split_members(user_id, status);
+ALTER TABLE expenses ADD COLUMN IF NOT EXISTS split_id int REFERENCES splits(id);

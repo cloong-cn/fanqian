@@ -161,6 +161,7 @@ const ICONS = {
   breakfast: '<path d="M3 18h18M6 18a6 6 0 0 1 12 0"/><path d="M12 4v3M4.9 8.9l2 2M19.1 8.9l-2 2"/>',
   lunch: '<circle cx="12" cy="12" r="4"/><path d="M12 2.5v2M12 19.5v2M2.5 12h2M19.5 12h2M5.3 5.3l1.4 1.4M17.3 17.3l1.4 1.4M5.3 18.7l1.4-1.4M17.3 6.7l1.4-1.4"/>',
   dinner: '<path d="M20 14.5A8 8 0 1 1 9.5 4a6.5 6.5 0 0 0 10.5 10.5z"/>',
+  fruit: '<path d="M3 9h18a9 9 0 0 1-18 0z"/><path d="M6.5 9a5.5 5.5 0 0 0 11 0"/><path d="M10 13v.01M14 13v.01M12 15.5v.01"/>',
   other: '<path d="M5 8h11v6a5 5 0 0 1-5 5h-1a5 5 0 0 1-5-5z"/><path d="M16 10h1.5a2.5 2.5 0 0 1 0 5H16M8 3.5v2M12 3.5v2"/>',
 };
 const icon = (k, cls = '') => `<svg class="${cls}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${ICONS[k]}</svg>`;
@@ -172,7 +173,7 @@ function shell(active, inner, { pendingBadge = false } = {}) {
   if (me.user.isAdmin) tabs.push(['admin', '管理', '#/admin']);
   const enter = enterNext; enterNext = false; enterNextWasSet = enter;
   $app.innerHTML = `<div class="wrap ${enter ? 'enter' : ''}">${inner}</div>
-    <nav class="tabs ${enter ? 'enter' : ''}">${tabs.map(([k, n, h]) => `<a href="${h}" class="${k === active ? 'on' : ''}">${icon(k)}${n}${k === 'admin' && pendingBadge ? '<span class="dotb"></span>' : ''}</a>`).join('')}</nav>`;
+    <nav class="tabs ${enter ? 'enter' : ''}">${tabs.map(([k, n, h]) => `<a href="${h}" class="${k === active ? 'on' : ''}">${icon(k)}${n}${(k === 'admin' && pendingBadge) || (k === 'home' && me.splitTodo) ? '<span class="dotb"></span>' : ''}</a>`).join('')}</nav>`;
   animateCounts();
 }
 function header(title, right = '') {
@@ -275,7 +276,7 @@ async function renderHome() {
         <div class="sum num ${sum ? '' : 'zero'}">${sum ? yuan(sum) : '未记'}</div>
         ${editable ? `<button class="add-btn" data-add="${m.key}" aria-label="添加${m.name}">${icon('plus')}</button>` : ''}
       </div>
-      ${items.length ? `<ul class="items">${items.map((x) => `<li data-id="${x.id}" class="${editable ? '' : 'ro'} ${x.id === lastAddedId ? 'new' : ''}">${itemLabel(x)}<span class="amt num">${yuan(x.cents)}</span></li>`).join('')}</ul>` : ''}
+      ${items.length ? `<ul class="items">${items.map((x) => `<li data-id="${x.id}" class="${editable && canEditItem(x) ? '' : 'ro'} ${x.id === lastAddedId ? 'new' : ''}">${itemLabel(x)}<span class="amt num">${yuan(x.cents)}</span></li>`).join('')}</ul>` : ''}
     </section>`;
   }).join('');
 
@@ -296,9 +297,14 @@ async function renderHome() {
       <div class="meal-icon" style="--m: var(--accent)">${icon('plus')}</div>
       <div><b>怎么记账</b><div class="small">吃完饭点一下对应的餐次，输入花了多少钱就行。记下后会自动从你的余额里扣。</div></div>
       <button class="hint-x" id="hint-x" aria-label="知道了">知道了</button></div>` : ''}
+    ${me.splitTodo ? `<div class="hint" data-go="#/split" style="cursor:pointer">
+      <div class="meal-icon" style="--m: var(--m-other)">${icon('fruit')}</div>
+      <div><b>有 ${me.splitTodo} 个合买等你回应</b><div class="small">点这里看看，同意或拒绝</div></div>
+      ${icon('chev', 'chev')}</div>` : ''}
     ${mealsHtml}
     ${editable ? `<button class="btn soft block" data-add="other" style="margin-top:2px">${icon('plus')} 其他（零食、饮料…）</button>`
-      : `<div class="locked">${icon('lock')}这一天已锁定，如需修改请联系管理员</div>`}`);
+      : `<div class="locked">${icon('lock')}这一天已锁定，如需修改请联系管理员</div>`}
+    <button class="btn soft block" data-go="#/split" style="margin-top:10px">${icon('fruit')} 合买（大家一起买西瓜、水果…）</button>`);
   { const el = document.getElementById('hero-today'); el.innerHTML = countSpan(stats.todayCents, 'today'); animateCounts(el); }
   bindGo();
 
@@ -318,6 +324,7 @@ async function renderHome() {
   const dh = document.getElementById('hint-x');
   if (dh) dh.onclick = () => { lsSet('cw.hintDone', '1'); dh.closest('.hint').remove(); };
   if (editable) $app.querySelectorAll('li[data-id]').forEach((li) => li.onclick = () => {
+    if (li.classList.contains('ro')) return toast('合买的扣款不能自己修改，有问题请联系管理员');
     editExpense(dayData.items.find((i) => i.id === Number(li.dataset.id)), () => renderHome());
   });
 }
@@ -395,9 +402,12 @@ function editExpense(x, after) {
 // ---------- 明细 ----------
 // 记录名：有内容显示内容，没有就显示记账时间；管理员改过的加标记
 function itemLabel(x, prefix = '') {
-  const main = x.item ? esc(x.item) : `<span class="muted">${x.time ? x.time + ' 记' : '一笔'}</span>`;
-  return `<span class="name">${prefix}${main}${x.adminEdited ? '<span class="badge wait">管理员改过</span>' : ''}</span>`;
+  const text = x.splitId ? String(x.item || '').replace(/^合买·/, '') : x.item;   // 合买已有标签，不重复显示前缀
+  const main = text ? esc(text) : `<span class="muted">${x.time ? x.time + ' 记' : '一笔'}</span>`;
+  return `<span class="name">${prefix}${main}${x.splitId ? '<span class="badge accent">合买</span>' : ''}${x.adminEdited ? '<span class="badge wait">管理员改过</span>' : ''}</span>`;
 }
+// 合买的扣款普通用户不能自己改
+const canEditItem = (x) => !x.splitId || me.user.isAdmin;
 const emptyState = (text) => `<div class="card empty-state">${icon('bowl')}${text}</div>`;
 
 // ---------- 账单（明细 + 统计） ----------
@@ -481,7 +491,7 @@ function compactRow(key, left, items, editable, openSet) {
       <span class="dtot num">${yuan(total)}</span>
       ${icon('chev', 'dchev')}
     </button>
-    <div class="dbody"><div><ul class="items">${items.map((x) => `<li data-id="${x.id}" class="${editable ? '' : 'ro'}" style="${mealVar(x.meal)}">
+    <div class="dbody"><div><ul class="items">${items.map((x) => `<li data-id="${x.id}" class="${editable && canEditItem(x) ? '' : 'ro'}" style="${mealVar(x.meal)}">
       <span class="mdot"></span><span class="tag">${MEAL_NAME[x.meal]}</span>${itemLabel(x)}<span class="amt num">${yuan(x.cents)}</span></li>`).join('')}</ul>
       ${editable ? '' : `<div class="small muted dlock">${compactRoNote || '已锁定，修改请联系管理员'}</div>`}</div></div>
   </li>`;
@@ -814,6 +824,116 @@ async function renderTopup() {
   });
 }
 
+// ---------- 合买 ----------
+// 金额规则和服务端 splitShares() 一致：每人 round(总价/人数)，尾差由发起人（没参加则最早同意的人）补齐。这里只用来预览
+const perHead = (total, n) => (n ? Math.round(total / n) : 0);
+const SPLIT_MEMBER = { pending: ['未表态', 'wait'], agreed: ['同意', 'accent'], declined: ['拒绝', 'off'] };
+function splitCard(s) {
+  const agreed = s.members.filter((m) => m.status === 'agreed');
+  const waiting = s.members.filter((m) => m.status === 'pending');
+  const open = s.status === 'open';
+  let line;
+  if (open) line = `已同意 ${agreed.length} 人${waiting.length ? ` · 还有 ${waiting.length} 人没表态` : ''}${agreed.length ? ` · 按现在算每人约 ${yuan(perHead(s.totalCents, agreed.length))}` : ''}`;
+  else if (s.status === 'settled') line = `${agreed.length} 人分摊，已从余额里扣款`;
+  else line = '已取消，没有扣款';
+  const chip = (m) => {
+    const [txt, cls] = SPLIT_MEMBER[m.status];
+    const right = s.status === 'settled' && m.status === 'agreed' ? `<span class="num">${yuan(m.cents)}</span>`
+      : `<span class="badge ${cls}">${!open && m.status === 'pending' ? '未参加' : txt}</span>`;
+    return `<span class="chip" style="cursor:default">${esc(m.name)}${m.id === me.user.id ? '（我）' : ''} ${right}</span>`;
+  };
+  const acts = [];
+  if (open && s.myStatus === 'pending') acts.push(`<button class="btn sm" data-r="1">同意</button>`, `<button class="btn soft sm" data-r="0">拒绝</button>`);
+  else if (open && s.myStatus === 'agreed') acts.push(`<button class="btn soft sm" data-r="0">改为不参加</button>`);
+  else if (open && s.myStatus === 'declined') acts.push(`<button class="btn soft sm" data-r="1">改为参加</button>`);
+  if (s.canManage) acts.push(`<button class="btn soft sm" data-settle>${waiting.length ? '提前结算' : '结算'}</button>`, `<button class="btn soft sm" data-cancel style="color:var(--danger)">取消合买</button>`);
+  return `<section class="card" data-split="${s.id}">
+    <div style="display:flex;align-items:baseline;gap:8px">
+      <div style="font-weight:600;font-size:16px;flex:1;min-width:0">${esc(s.item)}
+        ${open ? '' : `<span class="badge ${s.status === 'settled' ? 'accent' : ''}">${s.status === 'settled' ? '已结算' : '已取消'}</span>`}</div>
+      <div class="num" style="font-weight:700;font-size:17px">${yuan(s.totalCents)}</div></div>
+    <div class="small muted" style="margin:2px 0 10px">${esc(s.creator.name)} 发起 · ${md(s.day)} · ${line}</div>
+    <div class="chips">${s.members.map(chip).join('')}</div>
+    ${acts.length ? `<div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:12px">${acts.join('')}</div>` : ''}
+  </section>`;
+}
+async function renderSplit() {
+  const list = await api('GET', '/api/splits');
+  const open = list.filter((s) => s.status === 'open'), done = list.filter((s) => s.status !== 'open');
+  shell('home', `
+    <header class="top"><div><a href="#/" class="small">‹ 记账</a><div class="title">合买</div></div></header>
+    <p class="small muted" style="margin:-6px 2px 12px">几个人一起买个西瓜、水果之类的：发起人选好一起分的人，被选的人同意或拒绝。所有人表态完自动按「同意的人数」平分扣款，四舍五入到分，尾差由发起人补齐；拒绝的人不扣钱。</p>
+    <button class="btn block" id="new">${icon('plus')} 发起合买</button>
+    ${open.length ? `<div class="section-title"><h3>进行中</h3></div>${open.map(splitCard).join('')}` : ''}
+    <div class="section-title"><h3>已结束</h3>${me.user.isAdmin ? '<span class="extra">管理员能看到本部门全部</span>' : ''}</div>
+    ${done.length ? done.map(splitCard).join('') : `<div class="card empty-state">${icon('fruit')}还没有结束的合买</div>`}`);
+  document.getElementById('new').onclick = () => newSplitSheet().catch(fail);
+  const after = async (msg) => { await refreshMe(); await renderSplit(); toast(msg); };
+  $app.querySelectorAll('[data-split]').forEach((card) => {
+    const s = list.find((x) => x.id === Number(card.dataset.split));
+    card.querySelectorAll('[data-r]').forEach((b) => b.onclick = async () => {
+      const agree = b.dataset.r === '1';
+      try {
+        const r = await api('POST', `/api/splits/${s.id}/respond`, { agree });
+        await after(r.settled ? '大家都表态了，已结算' : agree ? '已同意，等大家表态完再扣款' : '已拒绝，不会扣你的钱');
+      } catch (e) { fail(e); }
+    });
+    const st = card.querySelector('[data-settle]');
+    if (st) st.onclick = async () => {
+      const n = s.members.filter((m) => m.status === 'agreed').length;
+      const waiting = s.members.filter((m) => m.status === 'pending').length;
+      const msg = !n ? '现在还没有人同意，结算后这个合买会直接取消。继续吗？'
+        : `${waiting ? `还有 ${waiting} 人没表态，结算后算他们不参加。\n` : ''}按 ${n} 人分摊，每人约 ${yuan(perHead(s.totalCents, n))}，确定结算并扣款吗？`;
+      if (!confirm(msg)) return;
+      try { await api('POST', `/api/splits/${s.id}/settle`); await after(n ? '已结算' : '没人同意，已取消'); } catch (e) { fail(e); }
+    };
+    const cc = card.querySelector('[data-cancel]');
+    if (cc) cc.onclick = async () => {
+      if (!confirm(`取消合买「${s.item}」？不会扣任何人的钱。`)) return;
+      try { await api('POST', `/api/splits/${s.id}/cancel`); await after('已取消'); } catch (e) { fail(e); }
+    };
+  });
+}
+async function newSplitSheet() {
+  const people = await apiGet('/api/splits/people');
+  const picked = new Set([me.user.id]);   // 默认勾上自己（自己算同意），自己不吃可以取消
+  openSheet(`<h2>发起合买</h2>
+    <form id="sf">
+      <div class="field"><input name="item" placeholder="买的什么，比如：西瓜" maxlength="20" required></div>
+      <div class="field money-input"><span>¥</span><input name="amount" inputmode="decimal" placeholder="总价" required></div>
+      <div class="field"><label style="display:flex;justify-content:space-between">谁一起分（可多选）<a href="#" id="all" class="small">全选</a></label>
+        <div class="chips" id="pp">${people.map((p) => `<button type="button" class="chip pick" data-id="${p.id}">${esc(p.name)}${p.id === me.user.id ? '（我）' : ''}</button>`).join('')}</div></div>
+      <div class="small muted" id="pv" style="margin:-4px 2px 14px"></div>
+      <button class="btn block">发起</button>
+    </form>`, (sh) => {
+    const f = sh.querySelector('#sf'), pv = sh.querySelector('#pv');
+    const paint = () => {
+      sh.querySelectorAll('.pick').forEach((b) => b.classList.toggle('on', picked.has(Number(b.dataset.id))));
+      const v = f.amount.value.trim();
+      const cents = /^\d+(\.\d{1,2})?$/.test(v) ? Math.round(Number(v) * 100) : 0;
+      const n = picked.size;
+      pv.textContent = `已选 ${n} 人${cents && n ? `，如果都同意每人约 ${yuan(perHead(cents, n))}` : ''}。实际按同意的人数平分。${picked.has(me.user.id) ? '' : '你自己不参加分摊。'}`;
+    };
+    sh.querySelectorAll('.pick').forEach((b) => b.onclick = () => {
+      const id = Number(b.dataset.id); if (picked.has(id)) picked.delete(id); else picked.add(id); paint();
+    });
+    sh.querySelector('#all').onclick = (e) => {
+      e.preventDefault();
+      if (picked.size === people.length) { picked.clear(); picked.add(me.user.id); } else people.forEach((p) => picked.add(p.id));
+      paint();
+    };
+    f.amount.oninput = paint;
+    paint();
+    f.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      try {
+        await api('POST', '/api/splits', { item: f.item.value, amount: f.amount.value.trim(), members: [...picked] });
+        closeSheet(); await refreshMe(); await renderSplit(); toast('已发起，等大家表态');
+      } catch (err) { fail(err); }
+    });
+  });
+}
+
 // ---------- 我的 ----------
 function renderMe() {
   shell('me', `
@@ -826,6 +946,7 @@ function renderMe() {
     </div>
     <div class="card flush"><ul class="list">
       <li data-go="#/topup"><span class="meal-icon" style="--m: var(--accent)">${icon('wallet')}</span><div class="main"><div class="t">充值</div><div class="d">申请充值、查看充值记录</div></div>${me.pendingCents ? `<span class="badge wait">${yuan(me.pendingCents)} 待确认</span>` : ''}${icon('chev', 'chev')}</li>
+      <li data-go="#/split"><span class="meal-icon" style="--m: var(--m-other)">${icon('fruit')}</span><div class="main"><div class="t">合买</div><div class="d">几个人一起买水果，按人数平分</div></div>${me.splitTodo ? `<span class="badge count">${me.splitTodo}</span>` : ''}${icon('chev', 'chev')}</li>
       <li id="pw"><span class="meal-icon" style="--m: var(--m-lunch)">${icon('key')}</span><div class="main"><div class="t">修改密码</div></div>${icon('chev', 'chev')}</li>
       <li data-go="#/log"><span class="meal-icon" style="--m: var(--m-other)">${icon('history')}</span><div class="main"><div class="t">账户变动记录</div><div class="d">管理员对我账户做过的操作</div></div>${icon('chev', 'chev')}</li>
       <li id="xls"><span class="meal-icon" style="--m: var(--good)">${icon('excel')}</span><div class="main"><div class="t">导出 Excel</div><div class="d">下载消费明细和汇总表</div></div>${icon('chev', 'chev')}</li>
@@ -1230,6 +1351,7 @@ async function route() {
     if (h === '/bill') await renderBill();
     else if (h === '/history' || h === '/stats') { state.billTab = h === '/stats' ? 'stats' : 'detail'; lsSet('cw.billTab', state.billTab); await renderBill(); }
     else if (h === '/topup') await renderTopup();
+    else if (h === '/split') await renderSplit();
     else if (h === '/log') await renderMyLog();
     else if (h === '/me') renderMe();
     else if (h === '/admin' && me.user.isAdmin) await renderAdmin();

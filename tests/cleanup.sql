@@ -2,7 +2,9 @@
 BEGIN;
 CREATE TEMP TABLE zz AS SELECT id FROM users WHERE username LIKE 'zz%';
 DELETE FROM audit_log WHERE actor_id IN (SELECT id FROM zz) OR target_user_id IN (SELECT id FROM zz);
+DELETE FROM split_members WHERE user_id IN (SELECT id FROM zz) OR split_id IN (SELECT id FROM splits WHERE creator_id IN (SELECT id FROM zz));
 DELETE FROM expenses WHERE user_id IN (SELECT id FROM zz);
+DELETE FROM splits WHERE creator_id IN (SELECT id FROM zz);
 DELETE FROM topups   WHERE user_id IN (SELECT id FROM zz);
 UPDATE topups SET created_by=NULL WHERE created_by IN (SELECT id FROM zz);
 DELETE FROM sessions WHERE user_id IN (SELECT id FROM zz);

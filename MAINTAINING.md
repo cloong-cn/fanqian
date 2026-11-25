@@ -43,6 +43,8 @@ PostgreSQL（库 cw，表结构见 schema.sql）
 7. **删除一律是逻辑删除**：`users.deleted_at` / `departments.deleted_at` 打标记，不真删数据。查"当前有效"的人或部门时要加 `deleted_at IS NULL`（`userInScope`、`adminDept` 已经处理）；统计历史时**不要**排除已删除的人，否则合计会对不上。只能删余额为 0 的账号（`notDeletableReason`）。随部门删除的账号 `deleted_with_dept=true`，恢复部门时一起恢复。
 8. **普通用户只能改今天和昨天**：`canEditDay()`。管理员不限，管理员改别人的记录会打上 `admin_edited` 标记。
 
+9. **合买**（`splits` / `split_members`，`server.js` 的「合买」分区）：被选的人全部表态完自动结算，发起人或本部门管理员也可提前结算（未表态的算不参加）。按同意人数平分，`Math.round` 到分，尾差由发起人补齐（发起人没参加则由最早同意的人补齐），见 `splitShares()`。结算时给每个同意的人记一条 `meal='other'` 的消费，`expenses.split_id` 指回合买；普通用户不能改这类记录。有进行中合买的人不能删除。
+
 ## 权限模型
 
 三种角色：总管理员 `is_super`（管所有部门）、部门管理员 `is_admin`（只管本部门）、普通用户。登录后 `currentUser()` 会把总管理员的 `is_admin` 也设为 true。
