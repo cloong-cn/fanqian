@@ -176,6 +176,19 @@ function shell(active, inner, { pendingBadge = false } = {}) {
     <nav class="tabs ${enter ? 'enter' : ''}">${tabs.map(([k, n, h]) => `<a href="${h}" class="${k === active ? 'on' : ''}">${icon(k)}${n}${(k === 'admin' && pendingBadge) || (k === 'home' && me.splitTodo) ? '<span class="dotb"></span>' : ''}</a>`).join('')}</nav>`;
   animateCounts();
 }
+// 子页面左上角的返回按钮：站内跳过来的回上一页（比如从「我的」进合买就回「我的」），直接打开的回默认页面
+let prevHash = null;
+const BACK_NAME = { '#/': '记账', '#/bill': '账单', '#/me': '我的', '#/admin': '管理' };
+function backBtn(href, label) {
+  if (prevHash && BACK_NAME[prevHash] && prevHash !== location.hash) { href = prevHash; label = BACK_NAME[prevHash]; }
+  return `<a href="${href}" class="back" data-back>${icon('left')}<span>${label}</span></a>`;
+}
+// 返回的目标就是上一页时用 history.back()，这样不会在浏览历史里越积越多
+document.addEventListener('click', (e) => {
+  const a = e.target.closest('a[data-back]');
+  if (!a || a.getAttribute('href') !== prevHash) return;
+  e.preventDefault(); history.back();
+});
 function header(title, right = '') {
   return `<header class="top"><div><div class="title">${title}</div></div><div class="right">${right}</div></header>`;
 }
@@ -803,7 +816,7 @@ async function renderTopup() {
   const list = await api('GET', '/api/topups');
   const stats = await api('GET', '/api/stats');
   shell('me', `
-    <header class="top"><div><a href="#/me" class="small">‹ 我的</a><div class="title">充值</div></div></header>
+    <header class="top"><div>${backBtn('#/me', '我的')}<div class="title">充值</div></div></header>
     ${heroCard(stats.monthCents).replace('<button class="pill" data-go="#/topup">充值</button>', '')}
     <form class="card" id="tf">
       <h3>申请充值</h3>
@@ -870,7 +883,7 @@ async function renderSplit() {
   const list = await api('GET', '/api/splits');
   const open = list.filter((s) => s.status === 'open'), done = list.filter((s) => s.status !== 'open');
   shell('home', `
-    <header class="top"><div><a href="#/" class="small">‹ 记账</a><div class="title">合买</div></div></header>
+    <header class="top"><div>${backBtn('#/', '记账')}<div class="title">合买</div></div></header>
     <p class="small muted" style="margin:-6px 2px 12px">几个人一起买个西瓜、水果之类的：发起人选好一起分的人，被选的人同意或拒绝。所有人表态完自动按「同意的人数」平分扣款，精确到分，除不尽的几分钱随机分给几个人（每人最多多 1 分）；拒绝的人不扣钱。</p>
     <button class="btn block" id="new">${icon('plus')} 发起合买</button>
     ${open.length ? `<div class="section-title"><h3>进行中</h3></div>${open.map(splitCard).join('')}` : ''}
@@ -992,7 +1005,7 @@ function auditList(rows, { showTarget = false } = {}) {
 }
 async function renderMyLog() {
   const rows = await api('GET', '/api/audit/mine');
-  shell('me', `<header class="top"><div><a href="#/me" class="small">‹ 我的</a><div class="title">账户变动记录</div></div></header>
+  shell('me', `<header class="top"><div>${backBtn('#/me', '我的')}<div class="title">账户变动记录</div></div></header>
     <p class="small muted" style="margin:-6px 2px 12px">管理员对你的账户做过的所有操作（充值确认、调整余额、修改或删除你的记录等）都会记在这里，不能删除。</p>
     ${auditList(rows)}`);
 }
@@ -1378,7 +1391,9 @@ function prefetch(h) {
     else if (h === '/admin' && me.user.isAdmin) { apiGet(withDept('/api/admin/topups?status=pending')); apiGet('/api/admin/depts'); }
   } catch {}
 }
-window.addEventListener('hashchange', () => {
+window.addEventListener('hashchange', (e) => {
+  prevHash = new URL(e.oldURL).hash || '#/';
+  if (prevHash === '#') prevHash = '#/';
   if (!me) return;
   prefetch(location.hash.replace(/^#/, '') || '/');
   refreshMe().then(route).catch(() => {});

@@ -586,3 +586,11 @@ input.switch:focus { border: 0; }
 .split-entry .chev { width: 16px; height: 16px; color: var(--faint); flex: none; }
 .split-entry.todo { background: var(--warn-soft); border-color: color-mix(in srgb, var(--warn) 45%, transparent); }
 .split-entry.todo b { color: var(--warn); }
+/* 子页面返回按钮 */
+.back {
+  display: inline-flex; align-items: center; gap: 2px; height: 34px; padding: 0 12px 0 6px; margin: 0 0 8px -2px;
+  border-radius: 999px; background: var(--soft); color: var(--text); font-size: 15px; font-weight: 500; text-decoration: none;
+  transition: transform .12s var(--ease-out), background .2s;
+}
+.back svg { width: 18px; height: 18px; }
+.back:active { transform: scale(.95); }
