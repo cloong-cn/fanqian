@@ -683,7 +683,7 @@ async function renderStats() {
     : all
     ? `<div class="tile"><div class="k">期间充值</div><div class="v num">${yuan(a.topupCents)}</div><div class="delta">已确认入账</div></div>`
     : `<div class="tile"><div class="k">余额还够吃</div><div class="v num">${a.runwayDays == null ? '—' : a.runwayDays < 0 ? '已欠费' : a.runwayDays}<small>${a.runwayDays != null && a.runwayDays >= 0 ? '天' : ''}</small></div>
-       <div class="delta">按近30天日均 ${yuan(a.avg30Cents)}</div></div>`;
+       <div class="delta">按近30天每个吃饭日 ${yuan(a.avg30Cents)}</div></div>`;
 
   // 趋势：90 天以内按天，否则按月
   const byDay = a.days <= 92;
@@ -705,8 +705,8 @@ async function renderStats() {
     <div class="small muted" style="margin:0 2px 12px">${md(from)} – ${md(to)}</div>
     <div class="tiles">
       <div class="tile"><div class="k">${pname}花费</div><div class="v num">${countSpan(a.totalCents, 'st-total-' + scope)}</div>${delta}</div>
-      <div class="tile"><div class="k">日均</div><div class="v num">${countSpan(a.avgPerDayCents, 'st-avg-' + scope)}</div><div class="delta">共 ${a.days} 天</div></div>
-      <div class="tile"><div class="k">记账天数</div><div class="v num">${a.recordedDays}<small>/ ${a.days} 天</small></div><div class="delta">有记录的天平均 ${yuan(a.recordedDays ? Math.round(a.totalCents / a.recordedDays) : 0)}</div></div>
+      <div class="tile"><div class="k">日均</div><div class="v num">${countSpan(a.avgPerDayCents, 'st-avg-' + scope)}</div><div class="delta">只算有记录的 ${a.recordedDays} 天</div></div>
+      <div class="tile"><div class="k">记账天数</div><div class="v num">${a.recordedDays}<small>/ ${a.days} 天</small></div><div class="delta">没记的天不算进日均</div></div>
       ${tile4}
     </div>
     ${all && a.byUser ? `<div class="card anim"><h3>每人花费</h3><div class="sub">${pname} · 按金额排序</div>
@@ -726,7 +726,7 @@ async function renderStats() {
     Object.values(boxes).forEach((b) => b.classList.toggle('anim', anim));
     const w = boxes.trend.clientWidth;
     boxes.trend.innerHTML = columnChart(trendData, { width: w, avg: byDay && a.avgPerDayCents ? a.avgPerDayCents : null });
-    boxes.week.innerHTML = columnChart(a.weekday.map((d) => ({ label: '周' + WEEK[d.dow], value: d.avgCents, tip: `<b>周${WEEK[d.dow]}</b><br>平均 ${yuan(d.avgCents)}` })), { width: w, height: 140, labelEvery: 1 });
+    boxes.week.innerHTML = columnChart(a.weekday.map((d) => ({ label: '周' + WEEK[d.dow], value: d.avgCents, tip: `<b>周${WEEK[d.dow]}</b><br>有记录的${'周' + WEEK[d.dow]}平均 ${yuan(d.avgCents)}` })), { width: w, height: 140, labelEvery: 1 });
     boxes.months.innerHTML = columnChart(a.months.map((m) => ({ label: `${Number(m.month.slice(5))}月`, value: m.cents, tip: `<b>${m.month.replace('-', '年')}月</b><br>${yuan(m.cents)}` })), { width: w, height: 140, labelEvery: 2 });
   };
   draw(true);

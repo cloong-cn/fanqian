@@ -124,6 +124,13 @@ ok((await U.get('/api/me')).d.balanceCents === approvedSum - spent, 'balance aft
 ok((await A.post('/api/admin/topups', { userId: cu.d.id, setTo: '300' })).d.ok, 'set balance 300');
 ok((await U.get('/api/me')).d.balanceCents === 30000, 'balance is exactly 300');
 ok((await A.post('/api/admin/topups', { userId: cu.d.id, setTo: '300' })).s === 400, 'set same value rejected');
+{
+  // 两个管理员同时把余额设成同一个数：只能成功一次（事务 + 行锁），余额正好是目标值
+  const rs = await Promise.all([1, 2, 3].map(() => A.post('/api/admin/topups', { userId: cu.d.id, setTo: '123.45' })));
+  ok(rs.filter((r) => r.s === 200).length === 1 && rs.filter((r) => r.s === 400).length === 2, 'concurrent set-balance applies exactly once', rs.map((r) => r.s).join());
+  const back = await A.post('/api/admin/topups', { userId: cu.d.id, setTo: '300' });
+  ok(back.s === 200, 'set balance back');
+}
 ok((await A.post('/api/admin/topups', { userId: cu.d.id, amount: '-50.5', note: '扣' })).d.ok, 'adjust -50.5');
 ok((await U.get('/api/me')).d.balanceCents === 24950, 'balance 249.50');
 
@@ -146,6 +153,8 @@ const an = (await U.get(`/api/analytics?from=${from}&to=${T}`)).d;
 ok(an.totalCents === hist.totalCents, 'analytics total = history total', `${an.totalCents} vs ${hist.totalCents}`);
 ok(an.meals.reduce((a, m) => a + m.cents, 0) === an.totalCents, 'meal breakdown sums to total');
 ok(an.series.reduce((a, s) => a + s.cents, 0) === an.totalCents, 'daily series sums to total');
+ok(an.recordedDays === an.series.filter((x) => x.cents > 0).length, 'recordedDays = days with records');
+ok(an.avgPerDayCents === (an.recordedDays ? Math.round(an.totalCents / an.recordedDays) : 0), 'daily avg only counts recorded days');
 const an2 = (await U.get(`/api/analytics?from=${from}&to=${T}&user_id=all`)).d;
 ok(an2.byUser === undefined, 'user cannot request all-users stats');
 const anAll = (await A.get(`/api/analytics?from=${from}&to=${T}&user_id=all`)).d;

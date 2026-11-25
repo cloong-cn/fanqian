@@ -13,6 +13,8 @@ Environment=NODE_ENV=production PORT=8790 TZ=Asia/Shanghai
 #Environment=PGHOST=/var/run/postgresql PGDATABASE=cw
 # 可选：umami 访问统计
 #Environment=UMAMI_SCRIPT=https://umami.example.com/script.js UMAMI_WEBSITE_ID=xxxxxxxx-xxxx UMAMI_DOMAINS=cw.example.com
+# 每次启动（包括升级后重启）前先备份一次数据库；备份失败不阻止启动
+ExecStartPre=-+/bin/systemctl start cw-backup.service
 ExecStart=/usr/bin/node /srv/cw/app/server.js
 Restart=on-failure
 RestartSec=3

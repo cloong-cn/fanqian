@@ -1,7 +1,7 @@
 [Unit]
-Description=daily cw database backup
+Description=cw database backup every 2 hours
 [Timer]
-OnCalendar=*-*-* 03:30:00
+OnCalendar=*-*-* 00/2:30:00
 Persistent=true
 [Install]
 WantedBy=timers.target

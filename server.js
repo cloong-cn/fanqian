@@ -5,6 +5,7 @@ const crypto = require('node:crypto');
 const fs = require('node:fs');
 const path = require('node:path');
 const { Pool } = require('pg');
+const { AsyncLocalStorage } = require('node:async_hooks');
 const { buildXlsx } = require('./xlsx');
 
 const PORT = Number(process.env.PORT || 8790);
@@ -14,7 +15,25 @@ const SESSION_DAYS = 30;
 const LOW_BALANCE_CENTS = 5000;
 
 // 数据库：默认用本机 unix socket + peer 认证（无需密码）；也可用标准的 PGHOST/PGDATABASE/PGUSER/PGPASSWORD 环境变量
-const db = new Pool({ host: process.env.PGHOST || '/var/run/postgresql', database: process.env.PGDATABASE || 'cw', max: 10 });
+const pool = new Pool({ host: process.env.PGHOST || '/var/run/postgresql', database: process.env.PGDATABASE || 'cw', max: 10 });
+// 每个写请求整体放在一个数据库事务里（见路由）：中途任何一步出错，这次请求的所有改动一起撤销，
+// 不会出现"记录改了、日志没写"之类的半截数据。db.query 在事务里自动走事务连接，在外面走连接池。
+const txStore = new AsyncLocalStorage();
+const db = { query: (...a) => (txStore.getStore() || pool).query(...a), end: () => pool.end() };
+async function inTransaction(fn) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const result = await txStore.run(client, fn);
+    await client.query('COMMIT');
+    return result;
+  } catch (e) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw e;
+  } finally {
+    client.release();
+  }
+}
 
 // ---------- 读缓存 ----------
 // 本服务是数据库唯一的写入方：任何写操作成功后清空缓存；另设 30 秒过期兜底（例如有人手动改了数据库）。
@@ -204,7 +223,8 @@ const routes = [];
 function route(method, pattern, handler, opts = {}) {
   const keys = [];
   const re = new RegExp('^' + pattern.replace(/:(\w+)/g, (_, k) => { keys.push(k); return '(\\d+)'; }) + '$');
-  routes.push({ method, re, keys, handler, auth: opts.auth ?? 'user' });   // auth: none | user | admin | super
+  // auth: none | user | admin | super；tx: 写请求默认整体放进事务，false 表示不要（登录失败计数必须保留，不能随报错回滚）
+  routes.push({ method, re, keys, handler, auth: opts.auth ?? 'user', tx: opts.tx ?? method !== 'GET' });
 }
 
 // 登录核心：成功返回 token，失败抛 HttpError（401 密码不对 / 429 锁定）
@@ -237,7 +257,7 @@ route('POST', '/api/login', async ({ body, req, res }) => {
   const token = await doLogin(body.username, body.password, req);
   res.setHeader('Set-Cookie', sessionCookie(token, SESSION_DAYS * 86400));
   return { ok: true };
-}, { auth: 'none' });
+}, { auth: 'none', tx: false });
 
 // 浏览器原生表单登录（让浏览器可靠地弹出"保存密码"）：成功跳回首页，失败带错误跳回登录页
 async function formLogin(req, res) {
@@ -267,7 +287,7 @@ route('POST', '/api/logout', async ({ req, res }) => {
     [crypto.createHash('sha256').update(token).digest('hex')]);
   res.setHeader('Set-Cookie', sessionCookie('', 0));
   return { ok: true };
-}, { auth: 'none' });
+}, { auth: 'none', tx: false });
 
 route('GET', '/api/me', async ({ user }) => {
   const today = todayStr();
@@ -463,11 +483,12 @@ route('GET', '/api/analytics', async ({ user, query }) => {
   }
   const daily = { rows: [...dmap.keys()] };
   const series = [];
+  // 日均只按"有记录的天"算：没记账的天（休息日、没在食堂吃）不拉低平均数
   const dowDays = [0, 0, 0, 0, 0, 0, 0];
   for (let i = 0; i < span; i++) {
     const d = addDays(from, i);
     series.push({ day: d, cents: dmap.get(d) || 0 });
-    dowDays[(new Date(d + 'T00:00:00Z').getUTCDay() + 6) % 7]++;
+    if (dmap.has(d)) dowDays[(new Date(d + 'T00:00:00Z').getUTCDay() + 6) % 7]++;
   }
   const total = series.reduce((a, s) => a + s.cents, 0);
   const wmap = dowAgg;
@@ -483,7 +504,7 @@ route('GET', '/api/analytics', async ({ user, query }) => {
     totalCents: total,
     prevCents: prev.rows[0].cents,
     recordedDays: daily.rows.length,
-    avgPerDayCents: Math.round(total / span),
+    avgPerDayCents: daily.rows.length ? Math.round(total / daily.rows.length) : 0,
     series,
     meals: MEALS.map((m) => { const r = mealAgg.get(m); return { meal: m, cents: r ? r.cents : 0, n: r ? r.n : 0 }; }),
     weekday: dowDays.map((n, i) => ({ dow: i, avgCents: n ? Math.round((wmap.get(i + 1) || 0) / n) : 0 })),
@@ -502,11 +523,12 @@ route('GET', '/api/analytics', async ({ user, query }) => {
     out.byUser = byUser.rows.map((r) => ({ id: r.id, name: r.display_name, cents: r.cents, days: r.days }));
     out.topupCents = tops.rows[0].cents;
   } else {
-    // 按最近 30 天日均，余额还够吃几天
+    // 按最近 30 天里"有记录的天"的日均，余额还够吃几天（几个吃饭日）
     const { rows: [r30] } = await db.query(
-      `SELECT COALESCE(SUM(cents),0)::int AS cents FROM expenses WHERE user_id=$1 AND day > $2 AND day <= $3`,
+      `SELECT COALESCE(SUM(cents),0)::int AS cents, COUNT(DISTINCT day)::int AS days
+       FROM expenses WHERE user_id=$1 AND day > $2 AND day <= $3`,
       [uid, addDays(today, -30), today]);
-    out.avg30Cents = Math.round(r30.cents / 30);
+    out.avg30Cents = r30.days ? Math.round(r30.cents / r30.days) : 0;
     if (uid === user.id || user.is_admin) {
       const bal = await balances(uid);
       out.balanceCents = bal.balanceCents;
@@ -749,42 +771,32 @@ route('GET', '/api/admin/topups', async ({ user, query }) => {
 route('POST', '/api/admin/topups', async ({ user, body }) => {
   const uid = Number(body.userId);
   const note = cleanText(body.note, 60);
-  const client = await db.connect();
-  try {
-    await client.query('BEGIN');
-    // 锁住该用户，防止同时操作时差额算错
-    const target = await userInScope(user, uid, client);
-    if (target.is_super && !user.is_super) throw new HttpError(403, '不能调整总管理员的余额');
-    await client.query(`SELECT id FROM users WHERE id=$1 FOR UPDATE`, [uid]);
-    let cents, finalNote = note;
-    if (body.setTo !== undefined) {
-      const s = String(body.setTo).trim();
-      const target = s === '0' || /^-?0+(\.0{1,2})?$/.test(s) ? 0 : parseAmount(s, true);
-      if (target === null) throw bad('金额不对');
-      const { rows: [b] } = await client.query(`
-        SELECT (SELECT COALESCE(SUM(cents),0) FROM topups WHERE status='done' AND user_id=$1)
-             - (SELECT COALESCE(SUM(cents),0) FROM expenses WHERE user_id=$1) AS bal`, [uid]);
-      const cur = Number(b.bal);
-      cents = target - cur;
-      if (cents === 0) throw bad('余额已经是这个数了');
-      const f = (c) => (c < 0 ? '-' : '') + '¥' + (Math.abs(c) / 100).toFixed(2);
-      finalNote = `余额校正 ${f(cur)} → ${f(target)}${note ? '：' + note : ''}`.slice(0, 120);
-    } else {
-      cents = parseAmount(body.amount, true);
-      if (!cents) throw bad('金额不对');
-    }
-    await client.query(`INSERT INTO topups(user_id,cents,note,status,created_by,decided_at) VALUES($1,$2,$3,'done',$4,now())`,
-      [uid, cents, finalNote, user.id]);
-    await audit(client, user.id, uid, body.setTo !== undefined ? 'balance.set' : 'balance.adjust',
-      body.setTo !== undefined ? finalNote : `${cents > 0 ? '充值' : '扣减'} ${fmtY(cents)}${note ? '：' + note : ''}`);
-    await client.query('COMMIT');
-    return { ok: true, cents };
-  } catch (e) {
-    await client.query('ROLLBACK').catch(() => {});
-    throw e;
-  } finally {
-    client.release();
+  // 整个请求已在事务里（见路由）；锁住该用户，防止同时操作时差额算错
+  const target = await userInScope(user, uid, db);
+  if (target.is_super && !user.is_super) throw new HttpError(403, '不能调整总管理员的余额');
+  await db.query(`SELECT id FROM users WHERE id=$1 FOR UPDATE`, [uid]);
+  let cents, finalNote = note;
+  if (body.setTo !== undefined) {
+    const s = String(body.setTo).trim();
+    const target = s === '0' || /^-?0+(\.0{1,2})?$/.test(s) ? 0 : parseAmount(s, true);
+    if (target === null) throw bad('金额不对');
+    const { rows: [b] } = await db.query(`
+      SELECT (SELECT COALESCE(SUM(cents),0) FROM topups WHERE status='done' AND user_id=$1)
+           - (SELECT COALESCE(SUM(cents),0) FROM expenses WHERE user_id=$1) AS bal`, [uid]);
+    const cur = Number(b.bal);
+    cents = target - cur;
+    if (cents === 0) throw bad('余额已经是这个数了');
+    const f = (c) => (c < 0 ? '-' : '') + '¥' + (Math.abs(c) / 100).toFixed(2);
+    finalNote = `余额校正 ${f(cur)} → ${f(target)}${note ? '：' + note : ''}`.slice(0, 120);
+  } else {
+    cents = parseAmount(body.amount, true);
+    if (!cents) throw bad('金额不对');
   }
+  await db.query(`INSERT INTO topups(user_id,cents,note,status,created_by,decided_at) VALUES($1,$2,$3,'done',$4,now())`,
+    [uid, cents, finalNote, user.id]);
+  await audit(db, user.id, uid, body.setTo !== undefined ? 'balance.set' : 'balance.adjust',
+    body.setTo !== undefined ? finalNote : `${cents > 0 ? '充值' : '扣减'} ${fmtY(cents)}${note ? '：' + note : ''}`);
+  return { ok: true, cents };
 }, { auth: 'admin' });
 
 route('POST', '/api/admin/topups/:id/approve', async ({ user, params }) => {
@@ -981,7 +993,8 @@ const server = http.createServer(async (req, res) => {
       if (r.auth === 'admin' && !user.is_admin) throw new HttpError(403, '需要管理员权限');
       if (r.auth === 'super' && !user.is_super) throw new HttpError(403, '需要总管理员权限');
     }
-    const result = await r.handler({ req, res, user, params, body, query: url.searchParams });
+    const ctx = { req, res, user, params, body, query: url.searchParams };
+    const result = r.tx ? await inTransaction(() => r.handler(ctx)) : await r.handler(ctx);
     if (req.method !== 'GET') invalidateCache();
     if (result && result.__file) {
       const f = result.__file;
