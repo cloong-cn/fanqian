@@ -1,0 +1,6 @@
+[Unit]
+Description=cw database backup
+[Service]
+Type=oneshot
+User=cw
+ExecStart=/bin/sh -c 'f=/srv/cw/backups/cw-$(date +%%Y%%m%%d-%%H%%M).sql.gz; pg_dump -d cw | gzip > "$f" && find /srv/cw/backups -name "cw-*.sql.gz" -mtime +60 -delete'

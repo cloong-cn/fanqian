@@ -1,0 +1,26 @@
+# /etc/systemd/system/cw.service —— 按需修改路径和环境变量
+[Unit]
+Description=cw meal ledger
+After=network.target postgresql.service
+Requires=postgresql.service
+
+[Service]
+User=cw
+Group=cw
+WorkingDirectory=/srv/cw/app
+Environment=NODE_ENV=production PORT=8790 TZ=Asia/Shanghai
+# 数据库（默认：本机 unix socket，数据库 cw，peer 认证）
+#Environment=PGHOST=/var/run/postgresql PGDATABASE=cw
+# 可选：umami 访问统计
+#Environment=UMAMI_SCRIPT=https://umami.example.com/script.js UMAMI_WEBSITE_ID=xxxxxxxx-xxxx UMAMI_DOMAINS=cw.example.com
+ExecStart=/usr/bin/node /srv/cw/app/server.js
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadOnlyPaths=/srv/cw/app
+
+[Install]
+WantedBy=multi-user.target

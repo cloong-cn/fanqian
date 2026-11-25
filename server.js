@@ -13,8 +13,13 @@ const TZ = 'Asia/Shanghai';
 const SESSION_DAYS = 30;
 const LOW_BALANCE_CENTS = 5000;
 
-// 用 unix socket + peer 认证连接，不需要数据库密码
-const db = new Pool({ host: '/var/run/postgresql', database: 'cw', max: 5 });
+// 数据库：默认用本机 unix socket + peer 认证（无需密码）；也可用标准的 PGHOST/PGDATABASE/PGUSER/PGPASSWORD 环境变量
+const db = new Pool({ host: process.env.PGHOST || '/var/run/postgresql', database: process.env.PGDATABASE || 'cw', max: 5 });
+
+// 可选：umami 访问统计。设置了 UMAMI_SCRIPT 和 UMAMI_WEBSITE_ID 才会在页面里注入脚本
+const UMAMI = process.env.UMAMI_SCRIPT && process.env.UMAMI_WEBSITE_ID
+  ? `<script defer src="${process.env.UMAMI_SCRIPT}" data-website-id="${process.env.UMAMI_WEBSITE_ID}" data-auto-track="false"${process.env.UMAMI_DOMAINS ? ` data-domains="${process.env.UMAMI_DOMAINS}"` : ''}></script>\n`
+  : '';
 
 // ---------- 工具 ----------
 function todayStr() {
@@ -753,6 +758,7 @@ function serveStatic(req, res, pathname) {
       if (!path.extname(rel)) return serveStatic(req, res, '/');
       res.writeHead(404); return res.end('not found');
     }
+    if (UMAMI && path.basename(file) === 'index.html') data = Buffer.from(data.toString('utf8').replace('</head>', UMAMI + '</head>'));
     res.writeHead(200, { 'Content-Type': TYPES[path.extname(file)] || 'application/octet-stream',
       'Cache-Control': 'no-cache' });
     res.end(data);
