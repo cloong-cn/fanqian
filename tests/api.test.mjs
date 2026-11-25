@@ -24,6 +24,19 @@ ok((await anon.get('/api/me')).s === 401, 'anon /api/me 401');
 ok((await anon.login('zzadmin', 'wrong')).s === 401, 'wrong password 401');
 ok((await anon.login('ZZADMIN', 'test-admin-1')).s === 200, 'username case-insensitive');
 
+sec('表单登录（浏览器保存密码用）');
+{
+  const form = (u, pw, origin) => fetch(B + '/login', { method: 'POST', redirect: 'manual',
+    headers: { 'content-type': 'application/x-www-form-urlencoded', ...(origin ? { origin } : {}) },
+    body: new URLSearchParams({ username: u, password: pw }) });
+  const good = await form('zzadmin', 'test-admin-1', B);
+  ok(good.status === 303 && good.headers.get('location') === '/' && /cw_session=[a-f0-9]{64}/.test(good.headers.get('set-cookie') || ''), 'form login success -> 303 / + cookie');
+  const badf = await form('ZZadmin', 'nope', B);
+  ok(badf.status === 303 && badf.headers.get('location') === '/?e=bad&u=zzadmin' && !badf.headers.get('set-cookie'), 'form login failure -> 303 with error, no cookie');
+  ok((await form('zzadmin', 'test-admin-1', 'https://evil.example')).status === 403, 'form login from other site rejected');
+  ok((await form('zzadmin', 'test-admin-1', null)).status === 403, 'form login without Origin rejected');
+}
+await anon.req('GET', '/api/me');
 sec('管理员建用户');
 const cu = await A.post('/api/admin/users', { username: 'zzu', displayName: '测U' });
 ok(cu.s === 200 && /^[a-z]+-\d{4}$/.test(cu.d.password), 'create user w/ memorable pw', JSON.stringify(cu.d));

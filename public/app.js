@@ -171,16 +171,26 @@ function header(title, right = '') {
 async function refreshMe() { me = await api('GET', '/api/me'); }
 
 // ---------- 登录 ----------
+// 表单登录失败时服务器会跳回 /?e=bad&u=xxx；页面加载时读一次，然后清掉地址栏参数
+let loginFlash = (() => {
+  const q = new URLSearchParams(location.search);
+  const f = { e: q.get('e'), u: q.get('u') || '' };
+  if (f.e) history.replaceState(null, '', location.pathname + location.hash);
+  return f;
+})();
 function renderLogin() {
   // 表单用标准的 name/autocomplete，让手机自带的密码管理（iCloud 钥匙串 / Google 密码管理）能识别并记住
-  $app.innerHTML = `<form class="login" id="login" method="post" action="/api/login" autocomplete="on">
+  // 用浏览器原生提交（POST /login → 跳回首页），各家浏览器都能可靠地提示"保存密码"
+  if (document.getElementById('login')) return;   // 已经在登录页，不重复渲染（否则会清掉正在输入的内容）
+  const errCode = loginFlash.e, lastUser = loginFlash.u;
+  $app.innerHTML = `<form class="login" id="login" method="post" action="/login" autocomplete="on">
     <img class="logo" src="/icon.svg" alt="">
     <h1>饭钱账本</h1>
     <div class="tagline">记下每一顿，花得明明白白</div>
-    <div class="field"><input id="u" name="username" placeholder="用户名" autocomplete="username" autocapitalize="off" autocorrect="off" spellcheck="false" required></div>
+    <div class="field"><input id="u" name="username" value="${esc(lastUser)}" placeholder="用户名" autocomplete="username" autocapitalize="off" autocorrect="off" spellcheck="false" required></div>
     <div class="field pw-field"><input id="p" name="password" type="password" placeholder="密码" autocomplete="current-password" required>
       <button type="button" class="eye" id="eye" aria-label="显示密码">${icon('eye')}</button></div>
-    <div class="err" id="err"></div>
+    <div class="err" id="err">${errCode === 'locked' ? '尝试次数太多，请 15 分钟后再试' : errCode ? '用户名或密码不对' : ''}</div>
     <button class="btn block" type="submit">登录</button>
     <div class="small muted" style="text-align:center;margin-top:14px">登录后 30 天内常用不用再输密码</div>
   </form>`;
@@ -191,19 +201,11 @@ function renderLogin() {
     pw.type = show ? 'text' : 'password';
     eye.innerHTML = icon(show ? 'eyeOff' : 'eye'); eye.setAttribute('aria-label', show ? '隐藏密码' : '显示密码');
   };
-  document.getElementById('login').addEventListener('submit', async (e) => {
-    e.preventDefault();
-    const btn = e.target.querySelector('button'); btn.disabled = true;
-    try {
-      const username = document.getElementById('u').value, password = document.getElementById('p').value;
-      await api('POST', '/api/login', { username, password });
-      // 安卓 Chrome：主动请求浏览器保存账号密码（会弹出"保存密码？"）；Safari 不支持这个接口，靠上面的表单属性识别
-      if (window.PasswordCredential && navigator.credentials) {
-        try { await navigator.credentials.store(new PasswordCredential({ id: username.trim().toLowerCase(), password })); } catch {}
-      }
-      await refreshMe(); route();
-    } catch (err) { document.getElementById('err').textContent = err.message; }
-    finally { btn.disabled = false; }
+  if (lastUser) setTimeout(() => pw.focus(), 50);
+  document.getElementById('login').addEventListener('submit', (e) => {
+    const btn = e.target.querySelector('button[type=submit]');
+    if (btn.dataset.busy) { e.preventDefault(); return; }       // 防连点
+    btn.dataset.busy = '1'; btn.textContent = '登录中…';
   });
 }
 
@@ -1063,6 +1065,7 @@ window.addEventListener('load', () => setTimeout(() => trackPage(currentPagePath
 // ---------- 路由 ----------
 async function route() {
   if (!me) return renderLogin();
+  loginFlash = { e: null, u: '' };
   closeSheet(); hideTip(); resizeHook = null; enterNext = true;
   const h = location.hash.replace(/^#/, '') || '/';
   try {

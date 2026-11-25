@@ -159,9 +159,10 @@ function route(method, pattern, handler, opts = {}) {
   routes.push({ method, re, keys, handler, auth: opts.auth ?? 'user' });
 }
 
-route('POST', '/api/login', async ({ body, req, res }) => {
-  const username = cleanText(body.username, 40).toLowerCase();
-  const password = String(body.password ?? '').slice(0, 200);
+// 登录核心：成功返回 token，失败抛 HttpError（401 密码不对 / 429 锁定）
+async function doLogin(rawUser, rawPass, req) {
+  const username = cleanText(rawUser, 40).toLowerCase();
+  const password = String(rawPass ?? '').slice(0, 200);
   const key = `${username}|${clientIp(req)}`;
   const { rows: [fail] } = await db.query(
     `SELECT count FROM login_fails WHERE key=$1 AND first_at > now() - interval '15 minutes'`, [key]);
@@ -182,9 +183,35 @@ route('POST', '/api/login', async ({ body, req, res }) => {
   const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
   await db.query(`INSERT INTO sessions(token,user_id,expires_at) VALUES($1,$2,now() + $3::interval)`,
     [tokenHash, u.id, `${SESSION_DAYS} days`]);
+  return token;
+}
+route('POST', '/api/login', async ({ body, req, res }) => {
+  const token = await doLogin(body.username, body.password, req);
   res.setHeader('Set-Cookie', sessionCookie(token, SESSION_DAYS * 86400));
   return { ok: true };
 }, { auth: 'none' });
+
+// 浏览器原生表单登录（让浏览器可靠地弹出"保存密码"）：成功跳回首页，失败带错误跳回登录页
+async function formLogin(req, res) {
+  const redirect = (loc) => { res.writeHead(303, { Location: loc, 'Cache-Control': 'no-store' }); res.end(); };
+  // 只接受本站页面提交的表单（防止别的网站替你登录到别人的账号）
+  let sameOrigin = false;
+  try { sameOrigin = new URL(req.headers.origin || '').host === req.headers.host; } catch {}
+  if (!sameOrigin) { res.writeHead(403, { 'Content-Type': 'text/plain; charset=utf-8' }); return res.end('请从登录页登录'); }
+  let raw = '';
+  try { raw = await readBody(req); } catch { return redirect('/?e=bad'); }
+  const f = new URLSearchParams(raw);
+  const u = cleanText(f.get('username'), 40).toLowerCase();
+  try {
+    const token = await doLogin(f.get('username'), f.get('password'), req);
+    res.setHeader('Set-Cookie', sessionCookie(token, SESSION_DAYS * 86400));
+    return redirect('/');
+  } catch (e) {
+    const code = e instanceof HttpError && e.status === 429 ? 'locked' : 'bad';
+    if (!(e instanceof HttpError)) console.error(e);
+    return redirect(`/?e=${code}&u=${encodeURIComponent(u)}`);
+  }
+}
 
 route('POST', '/api/logout', async ({ req, res }) => {
   const token = parseCookies(req).cw_session;
@@ -744,6 +771,7 @@ function readBody(req) {
 
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://x');
+  if (req.method === 'POST' && url.pathname === '/login') return formLogin(req, res).catch((e) => { console.error(e); res.writeHead(500); res.end(); });
   if (!url.pathname.startsWith('/api/')) {
     if (req.method !== 'GET' && req.method !== 'HEAD') { res.writeHead(405); return res.end(); }
     return serveStatic(req, res, url.pathname);
