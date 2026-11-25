@@ -892,13 +892,20 @@ async function renderAdmin() {
 }
 
 async function adminDepts(depts) {
+  const gone = await api('GET', '/api/admin/depts/deleted');
   const html = `<div class="section-title"><h3>部门 ${depts.length}</h3><span class="extra">各部门的钱和记录互相独立</span></div>
     <div class="card flush"><ul class="list">${depts.map((d) => `<li data-d="${d.id}">
       <div class="avatar">${initial(d.name)}</div>
       <div class="main"><div class="t">${esc(d.name)}${d.id === me.dept.id ? '<span class="badge">我所在</span>' : ''}</div><div class="d">${d.members} 人</div></div>
       <div class="r"><div class="small muted">部门总余额</div><div class="num ${d.poolCents < 0 ? 'neg' : ''}" style="font-weight:600">${yuan(d.poolCents)}</div></div>${icon('chev', 'chev')}</li>`).join('')}</ul></div>
     <button class="btn block" id="addd">${icon('plus')} 新建部门</button>
-    <p class="small muted" style="margin:12px 2px">新部门建好后，在顶部切换到该部门，再去「用户」里给它建人。也可以把某人设为「部门管理员」，让他自己管这个部门。</p>`;
+    <p class="small muted" style="margin:12px 2px">新部门建好后，在顶部切换到该部门，再去「用户」里给它建人。也可以把某人设为「部门管理员」，让他自己管这个部门。</p>
+    ${gone.length ? `<details class="deleted-box"><summary>已删除的部门 ${gone.length}</summary>
+      <div class="card flush"><ul class="list">${gone.map((d) => `<li style="cursor:default">
+        <div class="avatar off">${initial(d.name)}</div>
+        <div class="main"><div class="t">${esc(d.name)}</div><div class="d">${fmtTime(d.deletedAt)} 删除${d.members ? ` · 含 ${d.members} 个账号` : ''}</div></div>
+        <div class="r"><button class="btn soft sm" data-drestore="${d.id}">恢复</button></div></li>`).join('')}</ul></div>
+      <p class="small muted" style="margin:8px 2px">恢复部门时，当初随部门一起删除的账号也会一起恢复。</p></details>` : ''}`;
   const mount = () => {
     const nameSheet = (title, value, onOk) => openSheet(`<h2>${title}</h2><div class="field"><input id="dn" maxlength="20" value="${esc(value)}" placeholder="例如 技术部"></div>
       <div class="btns"><button class="btn soft" id="c">取消</button><button class="btn" id="o">保存</button></div>`, (s) => {
@@ -909,19 +916,24 @@ async function adminDepts(depts) {
       const d = await api('POST', '/api/admin/depts', { name });
       state.adminDept = d.id; toast(`已新建「${d.name}」，已切换到该部门`);
     });
+    $app.querySelectorAll('[data-drestore]').forEach((b) => b.onclick = async () => {
+      const d = gone.find((x) => x.id === Number(b.dataset.drestore));
+      if (!confirm(`恢复部门「${d.name}」${d.members ? `和其中 ${d.members} 个账号` : ''}？`)) return;
+      try { const r = await api('POST', `/api/admin/depts/${d.id}/restore`, {}); await refreshMe(); await renderAdmin(); toast(r.users ? `已恢复，含 ${r.users} 个账号` : '已恢复'); } catch (e) { fail(e); }
+    });
     $app.querySelectorAll('[data-d]').forEach((li) => li.onclick = () => {
       const d = depts.find((x) => x.id === Number(li.dataset.d));
       openSheet(`<h2>${esc(d.name)}</h2><div class="actions">
         <button class="btn" data-x="go">${icon('me')} 管理这个部门的人</button>
         <button class="btn soft" data-x="rename">改名</button>
-        ${d.members === 0 && d.id !== me.dept.id ? '<button class="btn danger" data-x="del">删除部门</button>' : ''}
-      </div>${d.members ? '<p class="small muted">部门里还有人，不能删除；可以先把人调到别的部门。</p>' : ''}`, (s) => {
+        ${d.id !== me.dept.id ? '<button class="btn danger" data-x="del">删除部门</button>' : ''}
+      </div><p class="small muted">${d.id === me.dept.id ? '这是你所在的部门，不能删除。' : '删除只是隐藏，数据全部保留，可以恢复。部门里每个人的余额都要是 0 才能删。'}</p>`, (s) => {
         s.querySelectorAll('[data-x]').forEach((b) => b.onclick = async () => {
           if (b.dataset.x === 'go') { closeSheet(); state.adminDept = d.id; state.adminTab = 'users'; statUsers = null; renderAdmin().catch(fail); }
           if (b.dataset.x === 'rename') nameSheet('部门改名', d.name, (name) => api('PUT', '/api/admin/depts/' + d.id, { name }));
           if (b.dataset.x === 'del') {
-            if (!confirm(`删除部门「${d.name}」？`)) return;
-            try { await api('DELETE', '/api/admin/depts/' + d.id); if (state.adminDept === d.id) state.adminDept = me.dept.id; closeSheet(); await refreshMe(); await renderAdmin(); toast('已删除'); } catch (e) { fail(e); }
+            if (!confirm(`删除部门「${d.name}」？${d.members ? `\n部门里的 ${d.members} 个账号也会一起删除，不能再登录。` : ''}\n数据全部保留，可以在「已删除的部门」里恢复。`)) return;
+            try { await api('DELETE', '/api/admin/depts/' + d.id); if (state.adminDept === d.id) state.adminDept = me.dept.id; closeSheet(); await refreshMe(); await renderAdmin(); toast('部门已删除，可恢复'); } catch (e) { fail(e); }
           }
         });
       }, false);
@@ -947,9 +959,10 @@ function visCard() {
     <input type="checkbox" class="switch" id="vis" ${d.membersVisible ? 'checked' : ''}></label>`;
 }
 async function adminUsers() {
-  const users = await api('GET', withDept('/api/admin/users'));
-  statUsers = users;
-  const total = users.reduce((a, u) => a + u.balanceCents, 0);
+  const all = await api('GET', withDept('/api/admin/users'));
+  statUsers = all;
+  const users = all.filter((u) => !u.deleted), deleted = all.filter((u) => u.deleted);
+  const total = all.reduce((a, u) => a + u.balanceCents, 0);
   const html = `
     <div class="tiles">
       <div class="tile"><div class="k">部门总余额</div><div class="v num ${total < 0 ? 'neg' : ''}">${yuan(total)}</div></div>
@@ -962,8 +975,19 @@ async function adminUsers() {
       <div class="main"><div class="t">${esc(u.displayName)}${u.isSuper ? '<span class="badge accent">总管理员</span>' : u.isAdmin ? '<span class="badge accent">管理员</span>' : ''}${u.disabled ? '<span class="badge off">已停用</span>' : ''}</div>
         <div class="d">${esc(u.username)} · 本月 ${yuan(u.monthSpentCents)} · 最近 ${u.lastDay ? md(u.lastDay) : '无记录'}</div></div>
       <div class="r num ${u.balanceCents < 0 ? 'neg' : ''}" style="font-weight:600">${yuan(u.balanceCents)}</div>${icon('chev', 'chev')}</li>`).join('')}</ul></div>
-    <button class="btn block" id="add">${icon('plus')} 新建用户</button>`;
+    <button class="btn block" id="add">${icon('plus')} 新建用户</button>
+    ${deleted.length ? `<details class="deleted-box"><summary>已删除的账号 ${deleted.length}</summary>
+      <div class="card flush"><ul class="list">${deleted.map((u) => `<li style="cursor:default">
+        <div class="avatar off">${initial(u.displayName)}</div>
+        <div class="main"><div class="t">${esc(u.displayName)}</div><div class="d">${esc(u.username)} · ${fmtTime(u.deletedAt)} 删除</div></div>
+        <div class="r"><button class="btn soft sm" data-restore="${u.id}">恢复</button></div></li>`).join('')}</ul></div>
+      <p class="small muted" style="margin:8px 2px">删除只是隐藏，记录全部保留；恢复后可以照常登录（密码不变）。</p></details>` : ''}`;
   const mount = () => {
+    $app.querySelectorAll('[data-restore]').forEach((b) => b.onclick = async () => {
+      const u = deleted.find((x) => x.id === Number(b.dataset.restore));
+      if (!confirm(`恢复 ${u.displayName} 的账号？`)) return;
+      try { await api('POST', `/api/admin/users/${u.id}/restore`, {}); state.members = null; await refreshMe(); await renderAdmin(); toast('已恢复'); } catch (e) { fail(e); }
+    });
     document.getElementById('add').onclick = () => openSheet(`<h2>新建用户${me.deptCount > 1 ? ' · ' + esc(deptName(state.adminDept)) : ''}</h2>
       <div class="field"><label>用户名（登录用，小写字母/数字）</label><input id="nu" autocapitalize="off" autocorrect="off" maxlength="20" placeholder="例如 xiaowang"></div>
       <div class="field"><label>显示名字</label><input id="nd" maxlength="20" placeholder="例如 小王"></div>
@@ -1006,6 +1030,7 @@ function userActions(u) {
       ${u.id !== me.user.id && !u.isSuper ? `<button class="btn soft" data-a="role">${icon('admin')} ${u.isAdmin ? '取消部门管理员' : '设为部门管理员'}</button>` : ''}
       ${me.user.isSuper && u.id !== me.user.id && (state.depts || []).length > 1 ? `<button class="btn soft" data-a="move">${icon('out')} 调到其他部门</button>` : ''}
       ${u.id !== me.user.id && !locked ? `<button class="btn ${u.disabled ? 'soft' : 'danger'}" data-a="toggle">${u.disabled ? '启用账号' : '停用账号'}</button>` : ''}
+      ${u.id !== me.user.id && !u.isSuper ? `<button class="btn danger" data-a="del">删除账号</button>` : ''}
     </div>`, (s) => {
     s.querySelectorAll('[data-a]').forEach((b) => b.onclick = () => {
       const a = b.dataset.a;
@@ -1068,6 +1093,11 @@ function userActions(u) {
       if (a === 'toggle') {
         if (!confirm(`${u.disabled ? '启用' : '停用'} ${u.displayName}？${u.disabled ? '' : '\n停用后对方无法登录，记录和余额保留。'}`)) return;
         api('PUT', '/api/admin/users/' + u.id, { disabled: !u.disabled }).then(() => { closeSheet(); renderAdmin(); }).catch(fail);
+      }
+      if (a === 'del') {
+        if (u.balanceCents !== 0) return toast(`余额还有 ${yuan(u.balanceCents)}，请先把余额设为 0 再删除`);
+        if (!confirm(`删除 ${u.displayName} 的账号？\n删除后不能登录、不再显示，历史记录全部保留，可以在「已删除的账号」里恢复。`)) return;
+        api('DELETE', '/api/admin/users/' + u.id).then(async () => { closeSheet(); statUsers = null; state.members = null; await refreshMe(); await renderAdmin(); toast('已删除，可恢复'); }).catch(fail);
       }
       if (a === 'role') {
         const to = !u.isAdmin;

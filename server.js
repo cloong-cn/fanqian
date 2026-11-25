@@ -154,7 +154,7 @@ async function currentUser(req) {
     SELECT u.id, u.username, u.display_name, u.is_admin, u.is_super, u.dept_id,
            s.expires_at < now() + interval '${SESSION_DAYS - 1} days' AS stale
     FROM sessions s JOIN users u ON u.id = s.user_id
-    WHERE s.token=$1 AND s.expires_at > now() AND NOT u.disabled`, [tokenHash]);
+    WHERE s.token=$1 AND s.expires_at > now() AND NOT u.disabled AND u.deleted_at IS NULL`, [tokenHash]);
   const u = rows[0];
   if (!u) return null;
   u.is_admin = u.is_admin || u.is_super;   // 总管理员自然也是管理员
@@ -203,18 +203,19 @@ async function audit(q, actorId, targetUserId, action, detail, data = null) {
 async function adminDept(user, raw) {
   if (raw !== undefined && raw !== null && raw !== '' && user.is_super) {
     const id = Number(raw);
-    const { rows: [d] } = await db.query(`SELECT id FROM departments WHERE id=$1`, [Number.isInteger(id) && id > 0 && id < 2147483647 ? id : 0]);
+    const { rows: [d] } = await db.query(`SELECT id FROM departments WHERE id=$1 AND deleted_at IS NULL`, [Number.isInteger(id) && id > 0 && id < 2147483647 ? id : 0]);
     if (!d) throw bad('部门不存在');
     return d.id;
   }
   return user.dept_id;
 }
 // 目标用户必须在管理员能管的范围内（总管理员不限；部门管理员只能管本部门）
-async function userInScope(user, id, q = db) {
+// 已删除的账号默认当作不存在；只有"恢复"时传 includeDeleted
+async function userInScope(user, id, q = db, { includeDeleted = false } = {}) {
   const n = Number(id);
   if (!Number.isInteger(n) || n <= 0 || n > 2147483647) throw new HttpError(404, '用户不存在');
   const { rows: [u] } = await q.query(`SELECT * FROM users WHERE id=$1`, [n]);
-  if (!u || (!user.is_super && u.dept_id !== user.dept_id)) throw new HttpError(404, '用户不存在');
+  if (!u || (!user.is_super && u.dept_id !== user.dept_id) || (u.deleted_at && !includeDeleted)) throw new HttpError(404, '用户不存在');
   return u;
 }
 
@@ -237,7 +238,7 @@ async function doLogin(rawUser, rawPass, req) {
   if (fail && fail.count >= 8) throw new HttpError(429, '尝试次数太多，请 15 分钟后再试');
 
   const { rows: [u] } = await db.query(`SELECT * FROM users WHERE username=$1`, [username]);
-  const ok = checkPassword(password, u ? u.pw_hash : DUMMY_HASH) && u && !u.disabled;
+  const ok = checkPassword(password, u ? u.pw_hash : DUMMY_HASH) && u && !u.disabled && !u.deleted_at;
   if (!ok) {
     await db.query(`
       INSERT INTO login_fails(key,count,first_at) VALUES($1,1,now())
@@ -293,7 +294,7 @@ route('GET', '/api/me', async ({ user }) => {
   const today = todayStr();
   const [dept, deptCount, todayAll, bal] = await Promise.all([
     cached('dept:' + user.dept_id, async () => (await db.query(`SELECT id, name, members_visible FROM departments WHERE id=$1`, [user.dept_id])).rows[0]),
-    cached('deptCount', async () => Number((await db.query(`SELECT COUNT(*) AS n FROM departments`)).rows[0].n)),
+    cached('deptCount', async () => Number((await db.query(`SELECT COUNT(*) AS n FROM departments WHERE deleted_at IS NULL`)).rows[0].n)),
     cached(`today:${user.dept_id}:${today}`, async () => Number((await db.query(`SELECT COALESCE(SUM(e.cents),0) AS c FROM expenses e
       JOIN users u ON u.id=e.user_id WHERE e.day=$1 AND u.dept_id=$2`, [today, user.dept_id])).rows[0].c)),
     balances(user.id),
@@ -337,7 +338,7 @@ async function viewUserId(user, raw) {
   const n = Number(raw);
   if (!Number.isInteger(n) || n <= 0 || n > 2147483647) throw new HttpError(404, '用户不存在');
   const { rows: [t] } = await db.query(
-    `SELECT u.id FROM users u JOIN departments d ON d.id=u.dept_id WHERE u.id=$1 AND u.dept_id=$2 AND d.members_visible`, [n, user.dept_id]);
+    `SELECT u.id FROM users u JOIN departments d ON d.id=u.dept_id WHERE u.id=$1 AND u.dept_id=$2 AND d.members_visible AND u.deleted_at IS NULL`, [n, user.dept_id]);
   if (!t) throw new HttpError(403, '本部门没有开启成员互相查看');
   return t.id;
 }
@@ -515,7 +516,8 @@ route('GET', '/api/analytics', async ({ user, query }) => {
     const [byUser, tops] = await Promise.all([
       db.query(`SELECT u.id, u.display_name, COALESCE(SUM(e.cents),0)::int AS cents, COUNT(DISTINCT e.day)::int AS days
                 FROM users u LEFT JOIN expenses e ON e.user_id=u.id AND e.day >= $1 AND e.day <= $2
-                WHERE u.dept_id=$3 GROUP BY u.id ORDER BY cents DESC, u.id`, [from, to, dept]),
+                WHERE u.dept_id=$3 GROUP BY u.id HAVING u.deleted_at IS NULL OR COUNT(e.id) > 0
+                ORDER BY cents DESC, u.id`, [from, to, dept]),
       db.query(`SELECT COALESCE(SUM(cents),0)::int AS cents FROM topups WHERE status='done'
                 AND (created_at AT TIME ZONE '${TZ}')::date BETWEEN $1 AND $2
                 AND user_id IN (SELECT id FROM users WHERE dept_id=$3)`, [from, to, dept]),
@@ -600,11 +602,11 @@ route('GET', '/api/export', async ({ user, query }) => {
 
   if (all) {
     const { rows: us } = await db.query(`
-      SELECT u.id, u.display_name, u.username,
+      SELECT u.id, u.display_name, u.username, u.deleted_at,
         COALESCE((SELECT SUM(cents) FROM topups t WHERE t.user_id=u.id AND status='done'),0)
           - COALESCE((SELECT SUM(cents) FROM expenses e WHERE e.user_id=u.id),0) AS balance
       FROM users u WHERE u.dept_id=$1 ORDER BY u.id`, [dept]);
-    const per = us.map((u) => {
+    const per = us.filter((u) => !u.deleted_at || ex.some((r) => r.uid === u.id)).map((u) => {
       const mine = ex.filter((r) => r.uid === u.id);
       const m = Object.fromEntries(mealKeys.map((k) => [k, sum(mine.filter((r) => r.meal === k).map((r) => r.cents))]));
       return [u.display_name, u.username, ...mealKeys.map((k) => Y(m[k])), Y(sum(mine.map((r) => r.cents))),
@@ -673,16 +675,16 @@ route('GET', '/api/admin/users', async ({ user, query }) => {
   const dept = await adminDept(user, query.get('dept'));
   // 每人几个按索引的小查询（实测比整部门一次聚合快：最近一天走倒序索引、本月走日期索引）
   const rows = await cached(`adminUsers:${dept}:${todayStr()}`, async () => (await db.query(`
-    SELECT u.id,u.username,u.display_name,u.is_admin,u.is_super,u.dept_id,u.disabled,
+    SELECT u.id,u.username,u.display_name,u.is_admin,u.is_super,u.dept_id,u.disabled,u.deleted_at,
       COALESCE((SELECT SUM(cents) FROM topups t WHERE t.user_id=u.id AND status='done'),0)
         - COALESCE((SELECT SUM(cents) FROM expenses e WHERE e.user_id=u.id),0) AS balance,
       COALESCE((SELECT SUM(cents) FROM expenses e WHERE e.user_id=u.id
         AND day >= date_trunc('month', $1::date)),0) AS month_spent,
       (SELECT to_char(MAX(day),'YYYY-MM-DD') FROM expenses e WHERE e.user_id=u.id) AS last_day
-    FROM users u WHERE u.dept_id=$2 ORDER BY u.disabled, u.id`, [todayStr(), dept])).rows);
+    FROM users u WHERE u.dept_id=$2 ORDER BY u.deleted_at IS NOT NULL, u.disabled, u.id`, [todayStr(), dept])).rows);
   return rows.map((r) => ({
     id: r.id, username: r.username, displayName: r.display_name, isAdmin: r.is_admin || r.is_super, isSuper: r.is_super,
-    deptId: r.dept_id, disabled: r.disabled,
+    deptId: r.dept_id, disabled: r.disabled, deleted: !!r.deleted_at, deletedAt: r.deleted_at,
     balanceCents: Number(r.balance), monthSpentCents: Number(r.month_spent), lastDay: r.last_day,
   }));
 }, { auth: 'admin' });
@@ -701,7 +703,7 @@ route('POST', '/api/admin/users', async ({ user, body }) => {
     await audit(db, user.id, u.id, 'user.create', `新建用户 ${displayName}（${username}）${body.isAdmin ? '，管理员' : ''}`);
     return { id: u.id, username, password };
   } catch (e) {
-    if (e.code === '23505') throw bad('用户名已存在');
+    if (e.code === '23505') throw bad('用户名已存在（已删除的账号也占着名字，可以在「已删除」里恢复）');
     throw e;
   }
 }, { auth: 'admin' });
@@ -735,7 +737,7 @@ route('PUT', '/api/admin/users/:id', async ({ user, params, body }) => {
   if (body.deptId !== undefined && Number(body.deptId) !== u.dept_id) {
     if (!user.is_super) throw new HttpError(403, '只有总管理员能调整部门');
     if (id === user.id) throw bad('不能调整自己的部门');
-    const { rows: [d] } = await db.query(`SELECT id, name FROM departments WHERE id=$1`, [Number(body.deptId) || 0]);
+    const { rows: [d] } = await db.query(`SELECT id, name FROM departments WHERE id=$1 AND deleted_at IS NULL`, [Number(body.deptId) || 0]);
     if (!d) throw bad('部门不存在');
     const { rows: [from] } = await db.query(`SELECT name FROM departments WHERE id=$1`, [u.dept_id]);
     await db.query(`UPDATE users SET dept_id=$1 WHERE id=$2`, [d.id, id]);
@@ -838,7 +840,7 @@ route('GET', '/api/members', async ({ user, query }) => {
   const dept = user.is_admin ? await adminDept(user, query.get('dept')) : user.dept_id;
   const { rows: [d] } = await db.query(`SELECT members_visible FROM departments WHERE id=$1`, [dept]);
   if (!user.is_admin && !d.members_visible) return [];
-  const { rows } = await db.query(`SELECT id, display_name FROM users WHERE dept_id=$1 AND NOT disabled ORDER BY id`, [dept]);
+  const { rows } = await db.query(`SELECT id, display_name FROM users WHERE dept_id=$1 AND NOT disabled AND deleted_at IS NULL ORDER BY id`, [dept]);
   return rows.map((r) => ({ id: r.id, name: r.display_name }));
 });
 // 开关"成员互相查看"：部门管理员管本部门，总管理员管任意部门
@@ -846,7 +848,7 @@ route('PUT', '/api/admin/depts/:id/visibility', async ({ user, params, body }) =
   const id = params.id;
   if (!user.is_super && id !== user.dept_id) throw new HttpError(404, '部门不存在');
   const on = !!body.membersVisible;
-  const { rows: [d] } = await db.query(`UPDATE departments SET members_visible=$1 WHERE id=$2 RETURNING name`, [on, id]);
+  const { rows: [d] } = await db.query(`UPDATE departments SET members_visible=$1 WHERE id=$2 AND deleted_at IS NULL RETURNING name`, [on, id]);
   if (!d) throw new HttpError(404, '部门不存在');
   await audit(db, user.id, null, 'dept.visibility', `「${d.name}」${on ? '开启' : '关闭'}成员互相查看消费记录`);
   return { ok: true, membersVisible: on };
@@ -854,8 +856,8 @@ route('PUT', '/api/admin/depts/:id/visibility', async ({ user, params, body }) =
 // 部门列表：总管理员看全部，部门管理员只看自己部门
 route('GET', '/api/admin/depts', async ({ user }) => {
   const { rows } = await db.query(`
-    SELECT d.id, d.name, d.members_visible, (SELECT COUNT(*) FROM users u WHERE u.dept_id=d.id AND NOT u.disabled)::int AS members
-    FROM departments d WHERE $1 OR d.id=$2 ORDER BY d.id`, [user.is_super, user.dept_id]);
+    SELECT d.id, d.name, d.members_visible, (SELECT COUNT(*) FROM users u WHERE u.dept_id=d.id AND NOT u.disabled AND u.deleted_at IS NULL)::int AS members
+    FROM departments d WHERE ($1 OR d.id=$2) AND d.deleted_at IS NULL ORDER BY d.id`, [user.is_super, user.dept_id]);
   const pools = await Promise.all(rows.map((r) => deptPool(r.id)));
   return rows.map((r, i) => ({ id: r.id, name: r.name, members: r.members, membersVisible: r.members_visible, poolCents: pools[i] }));
 }, { auth: 'admin' });
@@ -866,25 +868,87 @@ route('POST', '/api/admin/depts', async ({ user, body }) => {
     const { rows: [d] } = await db.query(`INSERT INTO departments(name) VALUES($1) RETURNING id`, [name]);
     await audit(db, user.id, null, 'dept.create', `新建部门「${name}」`);
     return { id: d.id, name };
-  } catch (e) { if (e.code === '23505') throw bad('已有同名部门'); throw e; }
+  } catch (e) { if (e.code === '23505') throw bad('已有同名部门（也可能是已删除的部门，可以在「已删除的部门」里恢复）'); throw e; }
 }, { auth: 'super' });
 route('PUT', '/api/admin/depts/:id', async ({ user, params, body }) => {
   const name = cleanText(body.name, 20);
   if (!name) throw bad('请填写部门名称');
-  const { rows: [d] } = await db.query(`SELECT name FROM departments WHERE id=$1`, [params.id]);
+  const { rows: [d] } = await db.query(`SELECT name FROM departments WHERE id=$1 AND deleted_at IS NULL`, [params.id]);
   if (!d) throw new HttpError(404, '部门不存在');
   try { await db.query(`UPDATE departments SET name=$1 WHERE id=$2`, [name, params.id]); }
-  catch (e) { if (e.code === '23505') throw bad('已有同名部门'); throw e; }
+  catch (e) { if (e.code === '23505') throw bad('已有同名部门（也可能是已删除的部门，可以在「已删除的部门」里恢复）'); throw e; }
   if (name !== d.name) await audit(db, user.id, null, 'dept.rename', `部门改名「${d.name}」→「${name}」`);
   return { ok: true };
 }, { auth: 'super' });
-route('DELETE', '/api/admin/depts/:id', async ({ user, params }) => {
-  const { rows: [d] } = await db.query(`SELECT name, (SELECT COUNT(*) FROM users WHERE dept_id=$1)::int AS n FROM departments WHERE id=$1`, [params.id]);
-  if (!d) throw new HttpError(404, '部门不存在');
-  if (d.n > 0) throw bad('部门里还有人（含已停用的），先把人调走才能删除');
-  await db.query(`DELETE FROM departments WHERE id=$1`, [params.id]);
-  await audit(db, user.id, null, 'dept.delete', `删除部门「${d.name}」`);
+// ---------- 逻辑删除与恢复 ----------
+// 只打 deleted_at 标记，数据全部保留，随时可以恢复。删除的账号不能登录、不出现在列表里，但历史记录照常计入统计。
+// 只能删余额为 0、没有待确认充值的账号：否则那部分钱会从部门总余额里"消失"，账就对不上了。
+async function notDeletableReason(ids) {
+  if (!ids.length) return null;
+  const { rows } = await db.query(`
+    SELECT u.display_name, u.is_super,
+      COALESCE((SELECT SUM(cents) FROM topups t WHERE t.user_id=u.id AND status='done'),0)
+        - COALESCE((SELECT SUM(cents) FROM expenses e WHERE e.user_id=u.id),0) AS bal,
+      EXISTS (SELECT 1 FROM topups t WHERE t.user_id=u.id AND status='pending') AS pending
+    FROM users u WHERE u.id = ANY($1::int[]) ORDER BY u.id FOR UPDATE OF u`, [ids]);
+  const sup = rows.filter((r) => r.is_super);
+  if (sup.length) return `${sup.map((r) => r.display_name).join('、')} 是总管理员，不能删除`;
+  const money = rows.filter((r) => Number(r.bal) !== 0);
+  if (money.length) return `${money.map((r) => `${r.display_name}（余额 ${fmtY(Number(r.bal))}）`).join('、')} 余额不是 0，请先把余额设为 0 再删除`;
+  const pend = rows.filter((r) => r.pending);
+  if (pend.length) return `${pend.map((r) => r.display_name).join('、')} 还有待确认的充值，请先处理`;
+  return null;
+}
+
+route('DELETE', '/api/admin/users/:id', async ({ user, params }) => {
+  const u = await userInScope(user, params.id);
+  if (u.id === user.id) throw bad('不能删除自己');
+  const why = await notDeletableReason([u.id]);
+  if (why) throw bad(why);
+  await db.query(`UPDATE users SET deleted_at=now(), deleted_with_dept=false WHERE id=$1`, [u.id]);
+  await db.query(`DELETE FROM sessions WHERE user_id=$1`, [u.id]);
+  await audit(db, user.id, u.id, 'user.delete', `删除账号 ${u.display_name}（${u.username}），可恢复`);
   return { ok: true };
+}, { auth: 'admin' });
+
+route('POST', '/api/admin/users/:id/restore', async ({ user, params }) => {
+  const u = await userInScope(user, params.id, db, { includeDeleted: true });
+  if (!u.deleted_at) throw bad('这个账号没有被删除');
+  const { rows: [d] } = await db.query(`SELECT name, deleted_at FROM departments WHERE id=$1`, [u.dept_id]);
+  if (d.deleted_at) throw bad(`所在部门「${d.name}」已删除，请先恢复部门`);
+  await db.query(`UPDATE users SET deleted_at=NULL, deleted_with_dept=false WHERE id=$1`, [u.id]);
+  await audit(db, user.id, u.id, 'user.restore', `恢复账号 ${u.display_name}（${u.username}）`);
+  return { ok: true };
+}, { auth: 'admin' });
+
+// 删除部门：部门里的账号一起标记删除（恢复部门时一起恢复）
+route('DELETE', '/api/admin/depts/:id', async ({ user, params }) => {
+  const { rows: [d] } = await db.query(`SELECT id, name FROM departments WHERE id=$1 AND deleted_at IS NULL FOR UPDATE`, [params.id]);
+  if (!d) throw new HttpError(404, '部门不存在');
+  if (d.id === user.dept_id) throw bad('不能删除自己所在的部门');
+  const { rows: us } = await db.query(`SELECT id FROM users WHERE dept_id=$1 AND deleted_at IS NULL`, [d.id]);
+  const why = await notDeletableReason(us.map((r) => r.id));
+  if (why) throw bad(why);
+  await db.query(`UPDATE users SET deleted_at=now(), deleted_with_dept=true WHERE dept_id=$1 AND deleted_at IS NULL`, [d.id]);
+  await db.query(`DELETE FROM sessions WHERE user_id IN (SELECT id FROM users WHERE dept_id=$1)`, [d.id]);
+  await db.query(`UPDATE departments SET deleted_at=now() WHERE id=$1`, [d.id]);
+  await audit(db, user.id, null, 'dept.delete', `删除部门「${d.name}」${us.length ? `及其中 ${us.length} 个账号` : ''}，可恢复`);
+  return { ok: true, users: us.length };
+}, { auth: 'super' });
+
+route('GET', '/api/admin/depts/deleted', async () => {
+  const { rows } = await db.query(`
+    SELECT d.id, d.name, d.deleted_at, (SELECT COUNT(*) FROM users u WHERE u.dept_id=d.id AND u.deleted_with_dept)::int AS members
+    FROM departments d WHERE d.deleted_at IS NOT NULL ORDER BY d.deleted_at DESC`);
+  return rows.map((r) => ({ id: r.id, name: r.name, deletedAt: r.deleted_at, members: r.members }));
+}, { auth: 'super' });
+
+route('POST', '/api/admin/depts/:id/restore', async ({ user, params }) => {
+  const { rows: [d] } = await db.query(`UPDATE departments SET deleted_at=NULL WHERE id=$1 AND deleted_at IS NOT NULL RETURNING id, name`, [params.id]);
+  if (!d) throw new HttpError(404, '找不到已删除的这个部门');
+  const { rowCount } = await db.query(`UPDATE users SET deleted_at=NULL, deleted_with_dept=false WHERE dept_id=$1 AND deleted_with_dept`, [d.id]);
+  await audit(db, user.id, null, 'dept.restore', `恢复部门「${d.name}」${rowCount ? `及其中 ${rowCount} 个账号` : ''}`);
+  return { ok: true, users: rowCount };
 }, { auth: 'super' });
 
 // ---------- 日志查询 ----------

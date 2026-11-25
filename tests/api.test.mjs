@@ -259,7 +259,7 @@ sec('部门：隔离与权限');
   ok((await DA1.put('/api/admin/users/' + y.d.id, { displayName: '测U' })).s === 200, 'dept admin can manage own-dept user');
   ok((await S.put('/api/admin/users/' + meS.user.id, { isAdmin: false })).s === 400, 'super cannot demote self');
   ok((await S.put('/api/admin/depts/' + d2, { name: 'zz测试部二' })).s === 200, 'super renames dept');
-  ok((await S.del('/api/admin/depts/' + d2)).s === 400, 'cannot delete dept with members');
+  ok((await S.del('/api/admin/depts/' + d2)).s === 400, 'cannot delete dept while a member has balance');
   // 调动：余额跟人走
   const poolBefore = (await Yc.get('/api/me')).d.poolCents;
   ok((await S.put('/api/admin/users/' + x.d.id, { deptId: d1 })).s === 200, 'super moves user to dept 1');
@@ -270,6 +270,65 @@ sec('部门：隔离与权限');
   ok((await S.del('/api/admin/depts/' + d2)).s === 200, 'empty dept can be deleted');
 }
 
+
+sec('逻辑删除与恢复');
+{
+  const S = A;
+  const meS = (await S.get('/api/me')).d; const d1 = meS.dept.id;
+  const dd = (await S.post('/api/admin/depts', { name: 'zz删除部' })).d.id;
+  const mk = async (u, admin = false) => (await S.post('/api/admin/users', { username: u, displayName: '测' + u, password: 'pppppp', deptId: dd, isAdmin: admin })).d;
+  const r1 = await mk('zzr1'), r2 = await mk('zzr2'), ra = await mk('zzra', true);
+  const R1 = new C(), R2 = new C(), RA = new C();
+  await R1.login('zzr1', 'pppppp'); await R2.login('zzr2', 'pppppp'); await RA.login('zzra', 'pppppp');
+  // r1 有消费历史但余额归零；r2 余额不为 0
+  await S.post('/api/admin/topups', { userId: r1.id, amount: '20' });
+  await R1.post('/api/expenses', { meal: 'lunch', amount: '20' });
+  await S.post('/api/admin/topups', { userId: r2.id, amount: '5' });
+  ok((await RA.del('/api/admin/users/' + r2.id)).s === 400, 'cannot delete user with non-zero balance');
+  ok((await RA.del('/api/admin/users/' + ra.id)).s === 400, 'cannot delete self');
+  ok((await RA.del('/api/admin/users/' + meS.user.id)).s === 404, 'dept admin cannot delete other-dept / super');
+  await R2.post('/api/topups', { amount: '9' });
+  await S.post('/api/admin/topups', { userId: r2.id, setTo: '0' });
+  ok((await RA.del('/api/admin/users/' + r2.id)).s === 400, 'cannot delete user with pending top-up');
+  const pend = (await S.get('/api/admin/topups?status=pending&dept=' + dd)).d.find((t) => t.user_id === r2.id);
+  await S.post(`/api/admin/topups/${pend.id}/reject`);
+  // 删除有历史的 r1：不能登录、不在列表，但历史照常算进统计
+  const statBefore = (await S.get(`/api/analytics?from=${T}&to=${T}&user_id=all&dept=${dd}`)).d;
+  ok((await RA.del('/api/admin/users/' + r1.id)).s === 200, 'dept admin deletes zero-balance user');
+  ok((await R1.get('/api/me')).s === 401, 'deleted user logged out');
+  ok((await new C().login('zzr1', 'pppppp')).s === 401, 'deleted user cannot log in');
+  const lst = (await RA.get('/api/admin/users')).d;
+  ok(lst.find((u) => u.id === r1.id)?.deleted === true, 'deleted user flagged in admin list');
+  ok((await RA.get('/api/members')).d.every((m) => m.id !== r1.id), 'deleted user not in member picker');
+  ok((await RA.post('/api/admin/topups', { userId: r1.id, amount: '1' })).s === 404, 'cannot top up deleted user');
+  const statAfter = (await S.get(`/api/analytics?from=${T}&to=${T}&user_id=all&dept=${dd}`)).d;
+  ok(statAfter.totalCents === statBefore.totalCents && statAfter.byUser.reduce((a, u) => a + u.cents, 0) === statAfter.totalCents, 'deleted user history still counted, per-person sums match');
+  ok((await S.post('/api/admin/users', { username: 'zzr1', displayName: 'x', password: 'pppppp', deptId: dd })).s === 400, 'deleted username stays reserved');
+  ok((await RA.post(`/api/admin/users/${r1.id}/restore`, {})).s === 200, 'restore user');
+  ok((await new C().login('zzr1', 'pppppp')).s === 200, 'restored user can log in with old password');
+  ok((await RA.post(`/api/admin/users/${r1.id}/restore`, {})).s === 400, 'restore twice rejected');
+  // 删除部门：整个部门连人一起标记，恢复时一起回来；之前单独删掉的人不跟着恢复
+  ok((await RA.del('/api/admin/users/' + r2.id)).s === 200, 'delete r2 individually');
+  ok((await RA.del('/api/admin/depts/' + dd)).s === 403, 'dept admin cannot delete dept');
+  ok((await S.del('/api/admin/depts/' + d1)).s === 400, 'cannot delete own dept');
+  const pool1 = (await S.get('/api/me')).d.poolCents;
+  const dr = await S.del('/api/admin/depts/' + dd);
+  ok(dr.s === 200 && dr.d.users === 2, 'super deletes dept with zero-balance members', JSON.stringify(dr.d));
+  ok((await RA.get('/api/me')).s === 401, 'members of deleted dept logged out');
+  ok(!(await S.get('/api/admin/depts')).d.some((d) => d.id === dd), 'deleted dept hidden from list');
+  ok((await S.get('/api/admin/depts/deleted')).d.some((d) => d.id === dd && d.members === 2), 'deleted dept listed for restore');
+  ok((await S.get('/api/admin/users?dept=' + dd)).s === 400, 'cannot switch to deleted dept');
+  ok((await S.post('/api/admin/depts', { name: 'zz删除部' })).s === 400, 'deleted dept name stays reserved');
+  ok((await S.get('/api/me')).d.poolCents === pool1, 'own dept pool unaffected');
+  ok((await S.post(`/api/admin/users/${r1.id}/restore`, {})).s === 400, 'cannot restore user while dept deleted');
+  const rr = await S.post(`/api/admin/depts/${dd}/restore`, {});
+  ok(rr.s === 200 && rr.d.users === 2, 'restore dept brings its members back', JSON.stringify(rr.d));
+  ok((await new C().login('zzra', 'pppppp')).s === 200, 'restored dept member can log in');
+  ok((await new C().login('zzr2', 'pppppp')).s === 401, 'individually-deleted user stays deleted');
+  ok((await S.get('/api/admin/depts/deleted')).s === 200 && (await S.get('/api/admin/depts/deleted')).d.every((d) => d.id !== dd), 'restored dept gone from deleted list');
+  await RA.login('zzra', 'pppppp');
+  ok((await RA.get('/api/admin/depts/deleted')).s === 403, 'dept admin cannot list deleted depts');
+}
 
 sec('成员互相查看 + 缓存一致性');
 {

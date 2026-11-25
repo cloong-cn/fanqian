@@ -40,7 +40,8 @@ PostgreSQL（库 cw，表结构见 schema.sql）
 4. **每个写操作都要记操作日志**：调用 `audit(db, 操作人, 被操作的人, 'xxx.yyy', '给人看的中文描述')`。日志只增不删。
 5. **写请求自动在一个数据库事务里**（`route()` 里写请求默认 `tx: true`）：处理函数中途抛错，这次请求的所有改动都会撤销，不会留下"记录改了、日志没写"的半截数据。在处理函数里直接用 `db.query()` 就行，它会自动走事务连接。只有登录/退出设了 `tx: false`（登录失败计数必须保留）。需要"先读再根据结果写"（比如设置余额算差额）时，先 `SELECT ... FOR UPDATE` 锁住相关用户行。
 6. **日期按北京时间**：用 `todayStr()`、`addDays()`，不要用 `new Date()` 直接取日期。数据库里 `day` 是 `date` 类型。
-7. **普通用户只能改今天和昨天**：`canEditDay()`。管理员不限，管理员改别人的记录会打上 `admin_edited` 标记。
+7. **删除一律是逻辑删除**：`users.deleted_at` / `departments.deleted_at` 打标记，不真删数据。查"当前有效"的人或部门时要加 `deleted_at IS NULL`（`userInScope`、`adminDept` 已经处理）；统计历史时**不要**排除已删除的人，否则合计会对不上。只能删余额为 0 的账号（`notDeletableReason`）。随部门删除的账号 `deleted_with_dept=true`，恢复部门时一起恢复。
+8. **普通用户只能改今天和昨天**：`canEditDay()`。管理员不限，管理员改别人的记录会打上 `admin_edited` 标记。
 
 ## 权限模型
 

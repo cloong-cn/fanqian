@@ -85,3 +85,8 @@ CREATE INDEX IF NOT EXISTS topups_user_status ON topups(user_id, status) INCLUDE
 
 -- 部门开关：成员之间能否互相查看消费记录（只读，不含个人余额）。默认关闭
 ALTER TABLE departments ADD COLUMN IF NOT EXISTS members_visible boolean NOT NULL DEFAULT false;
+
+-- 逻辑删除：只打标记、不删数据，可以恢复。deleted_with_dept = 随部门一起删的（恢复部门时一起恢复）
+ALTER TABLE users ADD COLUMN IF NOT EXISTS deleted_at timestamptz;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS deleted_with_dept boolean NOT NULL DEFAULT false;
+ALTER TABLE departments ADD COLUMN IF NOT EXISTS deleted_at timestamptz;
