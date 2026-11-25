@@ -12,7 +12,7 @@ const STATUS_NAME = { pending: '待确认', done: '已入账', rejected: '已拒
 const WEEK = ['一', '二', '三', '四', '五', '六', '日'];
 
 let me = null;
-const state = { day: null, month: null, adminTab: 'users', adminFilter: null, statPeriod: 'month', statScope: '' };
+const state = { day: null, month: null, adminTab: 'users', adminFilter: null, statPeriod: 'month', billUser: '', members: null };
 
 // ---------- 工具 ----------
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -77,7 +77,18 @@ function loading(on) {
 }
 
 const pending = new Set();
+// 同一个 GET 正在请求或 1.5 秒内刚请求过，就复用结果（切页时预取的数据由页面直接用上）
+const getCache = new Map();
+function apiGet(url) {
+  const hit = getCache.get(url);
+  if (hit && Date.now() - hit.at < 1500) return hit.p;
+  const p = api('GET', url);
+  getCache.set(url, { p, at: Date.now() });
+  p.catch(() => getCache.delete(url));
+  return p;
+}
 async function api(method, url, body) {
+  if (method !== 'GET') getCache.clear();   // 有写操作，之前预取的数据作废
   const key = method === 'GET' ? null : method + ' ' + url + ' ' + JSON.stringify(body ?? {});
   if (key && pending.has(key)) { const e = new Error('处理中'); e.silent = true; throw e; }
   if (key) pending.add(key);
@@ -175,7 +186,7 @@ async function refreshMe() {
 // 管理员接口带上当前操作的部门（只有总管理员能切换部门）
 const withDept = (url) => (me && me.user.isSuper ? url + (url.includes('?') ? '&' : '?') + 'dept=' + state.adminDept : url);
 const deptName = (id) => ((state.depts || []).find((d) => d.id === id) || {}).name || (me.dept && me.dept.id === id ? me.dept.name : '');
-async function loadDepts() { state.depts = await api('GET', '/api/admin/depts'); return state.depts; }
+async function loadDepts() { state.depts = await apiGet('/api/admin/depts'); return state.depts; }
 
 // ---------- 登录 ----------
 // 表单登录失败时服务器会跳回 /?e=bad&u=xxx；页面加载时读一次，然后清掉地址栏参数
@@ -245,9 +256,9 @@ async function renderHome() {
   const yesterday = addDays(me.today, -1);
   if (!me.user.isAdmin && state.day !== me.today && state.day !== yesterday) state.day = me.today;
   const [dayData, stats, suggest] = await Promise.all([
-    api('GET', '/api/day?date=' + state.day),
-    api('GET', '/api/stats'),
-    suggestCache ? Promise.resolve(suggestCache) : api('GET', '/api/suggest'),
+    apiGet('/api/day?date=' + state.day),
+    apiGet('/api/stats'),
+    suggestCache ? Promise.resolve(suggestCache) : apiGet('/api/suggest'),
   ]);
   suggestCache = suggest;
   const total = dayData.items.reduce((a, x) => a + x.cents, 0);
@@ -393,16 +404,35 @@ const emptyState = (text) => `<div class="card empty-state">${icon('bowl')}${tex
 const lsGet = (k) => { try { return localStorage.getItem(k); } catch { return null; } };
 const lsSet = (k, v) => { try { localStorage.setItem(k, v); } catch {} };
 let billSwap = false;   // 页内切换明细/统计时，只给内容区播放切换动画
+// 账单"查看谁"：默认自己；部门开启成员互相查看后可选同部门其他人（只读）；管理员还可选"所有人"
+const billUserName = () => {
+  if (!state.billUser) return '';
+  if (state.billUser === 'all') return deptName(state.adminDept) + '所有人';
+  return ((state.members || []).find((m) => String(m.id) === state.billUser) || {}).name || '';
+};
+function memberPicker() {
+  const others = (state.members || []).filter((m) => m.id !== me.user.id);
+  if (!others.length && !me.user.isAdmin) return '';
+  return `<div class="viewer"><span class="small muted">查看</span><select id="bu">
+    <option value="">我自己</option>
+    ${me.user.isAdmin ? `<option value="all" ${state.billUser === 'all' ? 'selected' : ''}>${esc(deptName(state.adminDept))}所有人</option>` : ''}
+    ${others.map((m) => `<option value="${m.id}" ${String(m.id) === state.billUser ? 'selected' : ''}>${esc(m.name)}</option>`).join('')}
+  </select></div>
+  ${state.billUser && state.billUser !== 'all' && !me.user.isAdmin ? `<div class="viewing">${icon('eye')}正在看 ${esc(billUserName())} 的记录（只读）</div>` : ''}`;
+}
 function billShell(tab, inner, exportArgs) {
   shell('bill', `
     ${header('账单', `<button class="btn soft sm" id="xbtn">${icon('excel')} 导出</button>`)}
-    <div class="seg full bill-seg" style="margin-bottom:14px">
+    <div class="seg full bill-seg" style="margin-bottom:12px">
       <button data-bt="detail" class="${tab === 'detail' ? 'on' : ''}">明细</button>
       <button data-bt="stats" class="${tab === 'stats' ? 'on' : ''}">统计</button>
     </div>
+    ${memberPicker()}
     <div class="bill-body ${billSwap ? 'swap' : ''}">${inner}</div>`);
   billSwap = false;
   document.getElementById('xbtn').onclick = () => exportSheet(exportArgs()).catch(fail);
+  const bu = document.getElementById('bu');
+  if (bu) bu.onchange = () => { state.billUser = bu.value; state.openDays = new Set(); billSwap = true; renderBill().catch(fail); };
   $app.querySelectorAll('[data-bt]').forEach((b) => b.onclick = () => {
     if (b.dataset.bt === state.billTab) return;
     switchBill(b.dataset.bt).catch(fail);
@@ -424,12 +454,20 @@ async function switchBill(tab) {
   await (tab === 'stats' ? renderStats() : renderHistory());
   trackPage(currentPagePath());
 }
+async function loadMembers() {
+  state.members = await apiGet(me.user.isAdmin ? withDept('/api/members') : '/api/members');
+  // 选中的人已经不能看了（开关被关 / 调走了）就回到自己
+  if (state.billUser && state.billUser !== 'all' && !state.members.some((m) => String(m.id) === state.billUser)) state.billUser = '';
+  if (state.billUser === 'all' && !me.user.isAdmin) state.billUser = '';
+}
 async function renderBill() {
   if (!state.billTab) state.billTab = lsGet('cw.billTab') === 'stats' ? 'stats' : 'detail';
+  if (!state.members) await loadMembers();
   await (state.billTab === 'stats' ? renderStats() : renderHistory());
 }
 
 const MEAL_SHORT = { breakfast: '早', lunch: '午', dinner: '晚', other: '其他' };
+let compactRoNote = '';   // 看别人的记录时，展开后的提示文字
 // 紧凑行：左边一块（日期或人名）+ 各餐小计 + 合计，点开看每一笔
 function compactRow(key, left, items, editable, openSet) {
   const sums = MEALS.map((m) => ({ m: m.key, c: items.filter((x) => x.meal === m.key).reduce((a, x) => a + x.cents, 0) })).filter((x) => x.c);
@@ -445,7 +483,7 @@ function compactRow(key, left, items, editable, openSet) {
     </button>
     <div class="dbody"><div><ul class="items">${items.map((x) => `<li data-id="${x.id}" class="${editable ? '' : 'ro'}" style="${mealVar(x.meal)}">
       <span class="mdot"></span><span class="tag">${MEAL_NAME[x.meal]}</span>${itemLabel(x)}<span class="amt num">${yuan(x.cents)}</span></li>`).join('')}</ul>
-      ${editable ? '' : '<div class="small muted dlock">已锁定，修改请联系管理员</div>'}</div></div>
+      ${editable ? '' : `<div class="small muted dlock">${compactRoNote || '已锁定，修改请联系管理员'}</div>`}</div></div>
   </li>`;
 }
 function bindCompact(openSet, allItems, onEdit) {
@@ -491,18 +529,30 @@ function compactPeople(days, openSet) {
 async function renderHistory() {
   if (!state.month) state.month = me.today.slice(0, 7);
   if (!state.openDays) state.openDays = new Set();
-  const h = await api('GET', '/api/history?month=' + state.month);
   const [y, m] = state.month.split('-').map(Number);
+  const monthEnd = (() => { const d = new Date(Date.UTC(y, m, 0)); const e = d.toISOString().slice(0, 10); return e > me.today ? me.today : e; })();
+  const who = state.billUser;
+  let h;
+  if (who === 'all') {
+    // 管理员看全部门：按天分组、每人一行
+    const rows = await api('GET', withDept(`/api/admin/expenses?from=${state.month}-01&to=${monthEnd}`));
+    const days = [];
+    for (const r of rows) { let d = days[days.length - 1]; if (!d || d.day !== r.day) days.push(d = { day: r.day, cents: 0, items: [], editable: true }); d.cents += r.cents; d.items.push(r); }
+    h = { days, totalCents: rows.reduce((a, r) => a + r.cents, 0), people: true };
+  } else {
+    h = await apiGet('/api/history?month=' + state.month + (who ? '&user_id=' + who : ''));
+  }
+  compactRoNote = who && who !== 'all' && !me.user.isAdmin ? `这是 ${esc(billUserName())} 的记录，只能查看` : '';
   const isCurrent = state.month >= me.today.slice(0, 7);
   const avg = h.days.length ? Math.round(h.totalCents / h.days.length) : 0;
-  const monthEnd = (() => { const d = new Date(Date.UTC(y, m, 0)); const e = d.toISOString().slice(0, 10); return e > me.today ? me.today : e; })();
   billShell('detail', `
     <div class="monthbar">
       <button class="icon-btn" id="prev" aria-label="上个月">${icon('left')}</button>
       <div class="mid"><div class="m small muted">${y}年${m}月 · 记账 ${h.days.length} 天</div><div class="v num">${yuan(h.totalCents)}</div>${h.days.length ? `<div class="small muted">平均每天 ${yuan(avg)}</div>` : ''}</div>
       <button class="icon-btn" id="next" aria-label="下个月" ${isCurrent ? 'disabled' : ''}>${icon('chev')}</button>
     </div>
-    ${h.days.length ? compactDays(h.days, state.openDays) : emptyState('这个月还没有记录')}`, () => ({ from: state.month + '-01', to: monthEnd }));
+    ${h.days.length ? (h.people ? compactPeople(h.days, state.openDays) : compactDays(h.days, state.openDays)) : emptyState('这个月还没有记录')}`,
+    () => ({ from: state.month + '-01', to: monthEnd, scope: me.user.isAdmin ? who : '' }));
   const shift = (n) => { const d = new Date(Date.UTC(y, m - 1 + n, 1)); state.month = d.toISOString().slice(0, 7); renderHistory().catch(fail); };
   document.getElementById('prev').onclick = () => shift(-1);
   document.getElementById('next').onclick = () => shift(1);
@@ -611,15 +661,11 @@ function aggregateMonthly(series) {
 let statUsers = null;
 async function renderStats() {
   const [from, to, pname] = periodRange(state.statPeriod);
-  const scope = me.user.isAdmin ? state.statScope : '';
+  const scope = state.billUser;
   const q = new URLSearchParams({ from, to });
   if (scope) q.set('user_id', scope);
   if (scope === 'all' && me.user.isSuper) q.set('dept', state.adminDept);
-  const [a, users] = await Promise.all([
-    api('GET', '/api/analytics?' + q),
-    me.user.isAdmin && !statUsers ? api('GET', withDept('/api/admin/users')) : Promise.resolve(statUsers),
-  ]);
-  statUsers = users;
+  const a = await api('GET', '/api/analytics?' + q);
   const all = scope === 'all';
   const periods = [['week', '本周'], ['month', '本月'], ['last', '上月'], ['30', '近30天'], ['90', '近90天'], ['year', '今年']];
   // 从明细带过来的某个具体月份，作为一个额外的选项放在最前面
@@ -632,7 +678,9 @@ async function renderStats() {
     delta = pct === 0 ? '<div class="delta">与上期持平</div>'
       : `<div class="delta ${pct > 0 ? 'up' : 'down'}">${icon(pct > 0 ? 'up' : 'down')}比上期${pct > 0 ? '多' : '少'} ${Math.abs(pct)}%</div>`;
   }
-  const tile4 = all
+  const tile4 = a.hiddenBalance
+    ? `<div class="tile"><div class="k">记了多少笔</div><div class="v num">${a.meals.reduce((x, m) => x + m.n, 0)}<small>笔</small></div><div class="delta">余额只有本人能看</div></div>`
+    : all
     ? `<div class="tile"><div class="k">期间充值</div><div class="v num">${yuan(a.topupCents)}</div><div class="delta">已确认入账</div></div>`
     : `<div class="tile"><div class="k">余额还够吃</div><div class="v num">${a.runwayDays == null ? '—' : a.runwayDays < 0 ? '已欠费' : a.runwayDays}<small>${a.runwayDays != null && a.runwayDays >= 0 ? '天' : ''}</small></div>
        <div class="delta">按近30天日均 ${yuan(a.avg30Cents)}</div></div>`;
@@ -652,13 +700,7 @@ async function renderStats() {
       <span class="num">${yuan(m.cents)}</span>
       <span class="pct num">${mealTotal ? Math.round(m.cents / mealTotal * 100) : 0}%</span></div>`).join('')}</div>` : '<div class="muted small">暂无数据</div>';
 
-  const userOpts = me.user.isAdmin ? `<div class="field" style="margin-bottom:10px"><select id="scope">
-      <option value="">我自己</option><option value="all" ${all ? 'selected' : ''}>${esc(deptName(state.adminDept))}所有人合计</option>
-      ${users.filter((u) => u.id !== me.user.id).map((u) => `<option value="${u.id}" ${String(u.id) === scope ? 'selected' : ''}>${esc(u.displayName)}</option>`).join('')}
-    </select></div>` : '';
-
   billShell('stats', `
-    ${userOpts}
     <div class="scroll-row" style="margin-bottom:6px"><div class="seg">${periods.map(([k, n]) => `<button data-p="${k}" class="${k === state.statPeriod ? 'on' : ''}">${n}</button>`).join('')}</div></div>
     <div class="small muted" style="margin:0 2px 12px">${md(from)} – ${md(to)}</div>
     <div class="tiles">
@@ -677,7 +719,7 @@ async function renderStats() {
     ${a.topItems.length ? `<div class="card anim"><h3>花钱最多的</h3><div class="sub">${pname}按总金额排名</div>
       ${hbars(a.topItems.map((t) => ({ name: t.item, value: t.cents, meta: `${t.n} 次`, tip: `<b>${esc(t.item)}</b><br>${t.n} 次 · 共 ${yuan(t.cents)} · 平均 ${yuan(Math.round(t.cents / t.n))}` })))}</div>` : ''}
     <div class="card"><h3>近 12 个月</h3><div class="sub">每月总花费</div>
-      <div class="chart-box" data-tipbox data-chart="months"></div></div>`, () => ({ from, to, scope }));
+      <div class="chart-box" data-tipbox data-chart="months"></div></div>`, () => ({ from, to, scope: me.user.isAdmin ? scope : '' }));
 
   const draw = (anim = false) => {
     const boxes = Object.fromEntries([...$app.querySelectorAll('[data-chart]')].map((b) => [b.dataset.chart, b]));
@@ -691,8 +733,6 @@ async function renderStats() {
   bindTips($app);
   resizeHook = draw;
   $app.querySelectorAll('[data-p]').forEach((b) => b.onclick = () => { state.statPeriod = b.dataset.p; renderStats().catch(fail); });
-  const sc = document.getElementById('scope');
-  if (sc) sc.onchange = () => { state.statScope = sc.value; renderStats().catch(fail); };
 }
 let resizeHook = null, resizeT;
 window.addEventListener('resize', () => { clearTimeout(resizeT); resizeT = setTimeout(() => resizeHook && resizeHook(), 150); });
@@ -830,7 +870,7 @@ async function renderMyLog() {
 // ---------- 管理 ----------
 async function renderAdmin() {
   const tab = state.adminTab;
-  const [pending, depts] = await Promise.all([api('GET', withDept('/api/admin/topups?status=pending')), loadDepts()]);
+  const [pending, depts] = await Promise.all([apiGet(withDept('/api/admin/topups?status=pending')), loadDepts()]);
   const tabs = [['users', '用户'], ['topups', '充值'], ['expenses', '消费'], ['audit', '日志']];
   if (me.user.isSuper) tabs.push(['depts', '部门']);
   // 总管理员：顶部切换正在管理的部门
@@ -847,7 +887,7 @@ async function renderAdmin() {
   shell('admin', head + body, { pendingBadge: pending.length > 0 });
   $app.querySelectorAll('[data-t]').forEach((b) => b.onclick = () => { state.adminTab = b.dataset.t; renderAdmin().then(() => trackPage(currentPagePath())).catch(fail); });
   const ad = document.getElementById('ad');
-  if (ad) ad.onchange = () => { state.adminDept = Number(ad.value); statUsers = null; state.adminFilter = null; state.auditFilter = null; renderAdmin().catch(fail); };
+  if (ad) ad.onchange = () => { state.adminDept = Number(ad.value); statUsers = null; state.members = null; state.billUser = ''; state.adminFilter = null; state.auditFilter = null; renderAdmin().catch(fail); };
   mount();
 }
 
@@ -899,6 +939,13 @@ function showPassword(username, pw) {
   }, false);
 }
 
+function visCard() {
+  const d = (state.depts || []).find((x) => x.id === state.adminDept);
+  if (!d) return '';
+  return `<label class="card switch-row"><div><div class="t">成员互相查看消费记录</div>
+    <div class="small muted">${d.membersVisible ? '已开启：本部门的人可以在「账单」里查看彼此的明细和统计（只读，看不到别人的余额）' : '已关闭：每个人只能看自己的记录'}</div></div>
+    <input type="checkbox" class="switch" id="vis" ${d.membersVisible ? 'checked' : ''}></label>`;
+}
 async function adminUsers() {
   const users = await api('GET', withDept('/api/admin/users'));
   statUsers = users;
@@ -908,6 +955,7 @@ async function adminUsers() {
       <div class="tile"><div class="k">部门总余额</div><div class="v num ${total < 0 ? 'neg' : ''}">${yuan(total)}</div></div>
       <div class="tile"><div class="k">本月总花费</div><div class="v num">${yuan(users.reduce((a, u) => a + u.monthSpentCents, 0))}</div></div>
     </div>
+    ${visCard()}
     <div class="section-title"><h3>用户 ${users.length}</h3><span class="extra">点用户查看操作</span></div>
     <div class="card flush"><ul class="list">${users.map((u) => `<li data-u="${u.id}">
       <div class="avatar">${initial(u.displayName)}</div>
@@ -934,6 +982,14 @@ async function adminUsers() {
       };
     });
     $app.querySelectorAll('[data-u]').forEach((li) => li.onclick = () => userActions(users.find((x) => x.id === Number(li.dataset.u))));
+    const vis = document.getElementById('vis');
+    if (vis) vis.onchange = async () => {
+      try {
+        await api('PUT', `/api/admin/depts/${state.adminDept}/visibility`, { membersVisible: vis.checked });
+        state.members = null; await refreshMe(); await renderAdmin();
+        toast(vis.checked ? '已开启，本部门成员可以互相查看记录' : '已关闭');
+      } catch (e) { vis.checked = !vis.checked; fail(e); }
+    };
   };
   return [html, mount];
 }
@@ -1028,7 +1084,7 @@ function userActions(u) {
         };
       }, false);
       if (a === 'view') { closeSheet(); state.adminTab = 'expenses'; state.adminFilter = { userId: String(u.id) }; renderAdmin().catch(fail); }
-      if (a === 'stats') { closeSheet(); state.statScope = u.id === me.user.id ? '' : String(u.id); location.hash = '#/stats'; }
+      if (a === 'stats') { closeSheet(); state.billUser = u.id === me.user.id ? '' : String(u.id); state.members = null; location.hash = '#/stats'; }
     });
   }, false);
 }
@@ -1152,7 +1208,20 @@ async function route() {
     trackPage(currentPagePath());
   } catch (e) { if (me) fail(e); }
 }
-window.addEventListener('hashchange', () => { if (me) refreshMe().then(route).catch(() => {}); });
+// 切页：页面要用的数据和 /api/me 同时发出，省掉一次往返
+function prefetch(h) {
+  try {
+    if (h === '/') { apiGet('/api/day?date=' + (state.day || me.today)); apiGet('/api/stats'); if (!suggestCache) apiGet('/api/suggest'); }
+    else if (h === '/bill' && (state.billTab || lsGet('cw.billTab')) !== 'stats' && state.billUser !== 'all')
+      apiGet('/api/history?month=' + (state.month || me.today.slice(0, 7)) + (state.billUser ? '&user_id=' + state.billUser : ''));
+    else if (h === '/admin' && me.user.isAdmin) { apiGet(withDept('/api/admin/topups?status=pending')); apiGet('/api/admin/depts'); }
+  } catch {}
+}
+window.addEventListener('hashchange', () => {
+  if (!me) return;
+  prefetch(location.hash.replace(/^#/, '') || '/');
+  refreshMe().then(route).catch(() => {});
+});
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState === 'visible' && me && $sheet.hidden) {
     const old = me.today;

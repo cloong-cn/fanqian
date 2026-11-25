@@ -91,7 +91,10 @@ ok(e1.item === '' && e1.time && !e1.adminEdited, 'amount-only record has time, n
 const ev = (await V.post('/api/expenses', { meal: 'dinner', amount: '20' })).d;
 ok((await V.put('/api/expenses/' + e1.id, { amount: '1' })).s === 404, 'V cannot edit U\'s record');
 ok((await V.del('/api/expenses/' + e1.id)).s === 404, 'V cannot delete U\'s record');
-ok((await U.get('/api/day?user_id=' + cv.d.id)).d.items.every((x) => x.userId === cu.d.id), 'user_id param ignored for non-admin');
+{ // 看同部门别人：开关关闭时拒绝；开启时只读可看
+  const vis = (await U.get('/api/me')).d.dept.membersVisible, r = await U.get('/api/day?user_id=' + cv.d.id);
+  ok(vis ? (r.s === 200 && r.d.editable === false && r.d.items.every((x) => x.userId === cv.d.id)) : r.s === 403, 'viewing another member follows dept visibility switch', String(r.s));
+}
 const upd = await U.put('/api/expenses/' + e2.id, { amount: '16', meal: 'dinner' });
 ok(upd.s === 200 && upd.d.cents === 1600 && upd.d.meal === 'dinner' && !upd.d.adminEdited, 'user edits own record');
 ok((await U.put('/api/expenses/99999999999', { amount: '1' })).s === 404, 'huge id -> 404 not 500');
@@ -256,6 +259,74 @@ sec('部门：隔离与权限');
   ok((await S.put('/api/admin/users/' + meS.user.id, { deptId: d2 })).s === 400, 'super cannot move self');
   for (const id of [xa.d.id, sup2.d.id]) await S.put('/api/admin/users/' + id, { deptId: d1 });
   ok((await S.del('/api/admin/depts/' + d2)).s === 200, 'empty dept can be deleted');
+}
+
+
+sec('成员互相查看 + 缓存一致性');
+{
+  const S = A;
+  const meS = (await S.get('/api/me')).d; const d1 = meS.dept.id;
+  const dv = (await S.post('/api/admin/depts', { name: 'zz可见部' })).d.id;
+  const mk = async (u, admin = false, dept = dv) => (await S.post('/api/admin/users', { username: u, displayName: '测' + u, password: 'pppppp', deptId: dept, isAdmin: admin })).d;
+  const p1 = await mk('zzm1'), p2 = await mk('zzm2'), pa = await mk('zzma', true), q1 = await mk('zzq1', false, d1);
+  const P1 = new C(), P2 = new C(), PA = new C(), Q1 = new C();
+  for (const [c, u] of [[P1, 'zzm1'], [P2, 'zzm2'], [PA, 'zzma'], [Q1, 'zzq1']]) await c.login(u, 'pppppp');
+  await S.post('/api/admin/topups', { userId: p2.id, amount: '200' });
+  const e2 = (await P2.post('/api/expenses', { meal: 'lunch', amount: '18' })).d;
+  const M = T.slice(0, 7);
+
+  // 默认关闭
+  ok((await P1.get('/api/me')).d.dept.membersVisible === false, 'visibility off by default');
+  ok((await P1.get('/api/members')).d.length === 0, 'members list empty when off');
+  ok((await P1.get(`/api/history?month=${M}&user_id=${p2.id}`)).s === 403, 'cannot view others history when off');
+  ok((await P1.get(`/api/analytics?from=${T}&to=${T}&user_id=${p2.id}`)).s === 403, 'cannot view others stats when off');
+  ok((await P1.get(`/api/day?user_id=${p2.id}`)).s === 403, 'cannot view others day when off');
+  // 开关权限
+  ok((await P1.put(`/api/admin/depts/${dv}/visibility`, { membersVisible: true })).s === 403, 'regular user cannot toggle');
+  ok((await PA.put(`/api/admin/depts/${d1}/visibility`, { membersVisible: true })).s === 404, 'dept admin cannot toggle other dept');
+  ok((await PA.put(`/api/admin/depts/${dv}/visibility`, { membersVisible: true })).s === 200, 'dept admin toggles own dept on');
+  ok((await P1.get('/api/me')).d.dept.membersVisible === true, 'me reflects visibility on (cache invalidated)');
+  // 开启后：只读查看
+  const mem = (await P1.get('/api/members')).d;
+  ok(mem.some((m) => m.id === p2.id) && !mem.some((m) => m.id === q1.id), 'members list = own dept only');
+  const h = await P1.get(`/api/history?month=${M}&user_id=${p2.id}`);
+  ok(h.s === 200 && h.d.totalCents === 1800 && h.d.days.every((d) => d.editable === false), 'view others history read-only');
+  const an = (await P1.get(`/api/analytics?from=${T}&to=${T}&user_id=${p2.id}`)).d;
+  ok(an.totalCents === 1800 && an.balanceCents === null && an.runwayDays === null && an.hiddenBalance, 'others stats visible, balance hidden');
+  ok((await P2.get(`/api/analytics?from=${T}&to=${T}`)).d.balanceCents === 18200, 'own stats still show own balance');
+  ok((await P1.put('/api/expenses/' + e2.id, { amount: '1' })).s === 404, 'still cannot edit others record');
+  ok((await P1.del('/api/expenses/' + e2.id)).s === 404, 'still cannot delete others record');
+  ok((await P1.post('/api/expenses', { meal: 'lunch', amount: '1', user_id: p2.id })).d.userId === p1.id, 'cannot record for others (user_id ignored)');
+  await P1.del('/api/expenses/' + (await P1.get('/api/day')).d.items[0].id);
+  const exp = await P1.req('GET', `/api/export?from=${T}&to=${T}&user_id=${p2.id}`, undefined, true);
+  ok(decodeURIComponent(exp.h.get('content-disposition')).includes('测zzm1'), 'export of others falls back to own data');
+  ok((await Q1.get(`/api/history?month=${M}&user_id=${p2.id}`)).s === 403, 'other dept cannot view even when on');
+  ok((await P1.get(`/api/history?month=${M}&user_id=${q1.id}`)).s === 403, 'cannot view into other dept');
+  // 关闭后立即失效
+  ok((await PA.put(`/api/admin/depts/${dv}/visibility`, { membersVisible: false })).s === 200, 'toggle off');
+  ok((await P1.get(`/api/history?month=${M}&user_id=${p2.id}`)).s === 403, 'access revoked immediately when off');
+
+  // 缓存一致性：先读（缓存起来），别人写了之后马上能看到新数字
+  const pool0 = (await P1.get('/api/me')).d.poolCents, today0 = (await P1.get('/api/me')).d.todayAllCents;
+  await P2.post('/api/expenses', { meal: 'dinner', amount: '7' });
+  const m1 = (await P1.get('/api/me')).d;
+  ok(m1.poolCents === pool0 - 700 && m1.todayAllCents === today0 + 700, 'pool/today refresh right after another user writes', JSON.stringify([pool0, m1.poolCents]));
+  const ul0 = (await PA.get('/api/admin/users')).d.find((u) => u.id === p2.id).balanceCents;
+  await S.post('/api/admin/topups', { userId: p2.id, amount: '10' });
+  ok((await PA.get('/api/admin/users')).d.find((u) => u.id === p2.id).balanceCents === ul0 + 1000, 'admin user list refreshes after top-up');
+  const dp0 = (await S.get('/api/admin/depts')).d.find((d) => d.id === dv).poolCents;
+  await P2.post('/api/expenses', { meal: 'other', amount: '3' });
+  ok((await S.get('/api/admin/depts')).d.find((d) => d.id === dv).poolCents === dp0 - 300, 'dept list pool refreshes after write');
+
+  // 静态文件 ETag / 304
+  const r1 = await fetch(B + '/app.js'); const et = r1.headers.get('etag'); await r1.arrayBuffer();
+  const r2 = await fetch(B + '/app.js', { headers: { 'if-none-match': et } });
+  ok(et && r2.status === 304, 'static ETag revalidation returns 304');
+  const r3 = await fetch(B + '/app.js', { headers: { 'if-none-match': 'W/' + et } });
+  ok(r3.status === 304, 'weak ETag (from nginx gzip) also returns 304');
+
+  for (const u of [p1, p2, pa]) await S.put('/api/admin/users/' + u.id, { deptId: d1 });
+  await S.del('/api/admin/depts/' + dv);
 }
 
 console.log(`\n通过 ${pass} 项，失败 ${failN} 项`);

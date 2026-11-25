@@ -14,7 +14,22 @@ const SESSION_DAYS = 30;
 const LOW_BALANCE_CENTS = 5000;
 
 // 数据库：默认用本机 unix socket + peer 认证（无需密码）；也可用标准的 PGHOST/PGDATABASE/PGUSER/PGPASSWORD 环境变量
-const db = new Pool({ host: process.env.PGHOST || '/var/run/postgresql', database: process.env.PGDATABASE || 'cw', max: 5 });
+const db = new Pool({ host: process.env.PGHOST || '/var/run/postgresql', database: process.env.PGDATABASE || 'cw', max: 10 });
+
+// ---------- 读缓存 ----------
+// 本服务是数据库唯一的写入方：任何写操作成功后清空缓存；另设 30 秒过期兜底（例如有人手动改了数据库）。
+// version 防止"写之前开始、写之后才算完"的旧结果被存进缓存。
+const memo = new Map();
+let memoVersion = 0;
+async function cached(key, fn, ttl = 30000) {
+  const hit = memo.get(key);
+  if (hit && Date.now() - hit.at < ttl) return hit.v;
+  const ver = memoVersion;
+  const v = await fn();
+  if (ver === memoVersion) memo.set(key, { v, at: Date.now() });
+  return v;
+}
+function invalidateCache() { memoVersion++; memo.clear(); }
 
 // 可选：umami 访问统计。设置了 UMAMI_SCRIPT 和 UMAMI_WEBSITE_ID 才会在页面里注入脚本
 const UMAMI = process.env.UMAMI_SCRIPT && process.env.UMAMI_WEBSITE_ID
@@ -85,16 +100,22 @@ class HttpError extends Error {
 const bad = (msg) => new HttpError(400, msg);
 
 // ---------- 余额 ----------
+async function deptPool(deptId) {
+  return cached('pool:' + deptId, async () => {
+    const { rows: [r] } = await db.query(`
+      SELECT (SELECT COALESCE(SUM(t.cents),0) FROM topups t JOIN users u ON u.id=t.user_id WHERE t.status='done' AND u.dept_id=$1)
+           - (SELECT COALESCE(SUM(e.cents),0) FROM expenses e JOIN users u ON u.id=e.user_id WHERE u.dept_id=$1) AS pool`, [deptId]);
+    return Number(r.pool);
+  });
+}
 async function balances(userId) {
-  const { rows: [r] } = await db.query(`
-    WITH d AS (SELECT id FROM users WHERE dept_id = (SELECT dept_id FROM users WHERE id=$1))
+  const [{ rows: [r] }, { rows: [d] }] = await Promise.all([db.query(`
     SELECT
-      (SELECT COALESCE(SUM(cents),0) FROM topups WHERE status='done' AND user_id IN (SELECT id FROM d))
-        - (SELECT COALESCE(SUM(cents),0) FROM expenses WHERE user_id IN (SELECT id FROM d)) AS pool,
       (SELECT COALESCE(SUM(cents),0) FROM topups WHERE status='done' AND user_id=$1)
         - (SELECT COALESCE(SUM(cents),0) FROM expenses WHERE user_id=$1) AS mine,
-      (SELECT COALESCE(SUM(cents),0) FROM topups WHERE status='pending' AND user_id=$1) AS pending`, [userId]);
-  return { poolCents: Number(r.pool), balanceCents: Number(r.mine), pendingCents: Number(r.pending) };
+      (SELECT COALESCE(SUM(cents),0) FROM topups WHERE status='pending' AND user_id=$1) AS pending`, [userId]),
+    db.query(`SELECT dept_id FROM users WHERE id=$1`, [userId])]);
+  return { poolCents: await deptPool(d.dept_id), balanceCents: Number(r.mine), pendingCents: Number(r.pending) };
 }
 
 // ---------- 会话 ----------
@@ -249,15 +270,22 @@ route('POST', '/api/logout', async ({ req, res }) => {
 }, { auth: 'none' });
 
 route('GET', '/api/me', async ({ user }) => {
+  const today = todayStr();
+  const [dept, deptCount, todayAll, bal] = await Promise.all([
+    cached('dept:' + user.dept_id, async () => (await db.query(`SELECT id, name, members_visible FROM departments WHERE id=$1`, [user.dept_id])).rows[0]),
+    cached('deptCount', async () => Number((await db.query(`SELECT COUNT(*) AS n FROM departments`)).rows[0].n)),
+    cached(`today:${user.dept_id}:${today}`, async () => Number((await db.query(`SELECT COALESCE(SUM(e.cents),0) AS c FROM expenses e
+      JOIN users u ON u.id=e.user_id WHERE e.day=$1 AND u.dept_id=$2`, [today, user.dept_id])).rows[0].c)),
+    balances(user.id),
+  ]);
   return {
     user: { id: user.id, username: user.username, displayName: user.display_name, isAdmin: user.is_admin, isSuper: user.is_super },
-    dept: (await db.query(`SELECT id, name FROM departments WHERE id=$1`, [user.dept_id])).rows[0],
-    deptCount: Number((await db.query(`SELECT COUNT(*) AS n FROM departments`)).rows[0].n),
-    today: todayStr(),
+    dept: { id: dept.id, name: dept.name, membersVisible: dept.members_visible },
+    deptCount,
+    today,
     lowBalanceCents: LOW_BALANCE_CENTS,
-    todayAllCents: Number((await db.query(`SELECT COALESCE(SUM(e.cents),0) AS c FROM expenses e JOIN users u ON u.id=e.user_id
-      WHERE e.day=$1 AND u.dept_id=$2`, [todayStr(), user.dept_id])).rows[0].c),
-    ...(await balances(user.id)),
+    todayAllCents: todayAll,
+    ...bal,
   };
 });
 
@@ -275,13 +303,25 @@ route('POST', '/api/password', async ({ user, body }) => {
 route('GET', '/api/day', async ({ user, query }) => {
   const day = query.get('date') || todayStr();
   if (!validDay(day)) throw bad('日期不对');
-  const uid = await targetUserId(user, query.get('user_id'));
+  const uid = await viewUserId(user, query.get('user_id'));
   const { rows } = await db.query(
     `SELECT ${EXP_COLS} FROM expenses
      WHERE user_id=$1 AND day=$2 ORDER BY id`, [uid, day]);
-  return { day, editable: canEditDay(user, day), items: rows.map(rowExpense) };
+  return { day, editable: (uid === user.id || user.is_admin) && canEditDay(user, day), items: rows.map(rowExpense) };
 });
 
+// 只读查看某人的记录：自己；管理员（范围内）；或部门开了"成员互相查看"时的同部门成员
+async function viewUserId(user, raw) {
+  if (!raw || Number(raw) === user.id) return user.id;
+  if (user.is_admin) return (await userInScope(user, raw)).id;
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n <= 0 || n > 2147483647) throw new HttpError(404, '用户不存在');
+  const { rows: [t] } = await db.query(
+    `SELECT u.id FROM users u JOIN departments d ON d.id=u.dept_id WHERE u.id=$1 AND u.dept_id=$2 AND d.members_visible`, [n, user.dept_id]);
+  if (!t) throw new HttpError(403, '本部门没有开启成员互相查看');
+  return t.id;
+}
+// 管理员替别人操作（写）：只有管理员可以，且在范围内
 async function targetUserId(user, raw) {
   if (raw && user.is_admin) return (await userInScope(user, raw)).id;
   return user.id;
@@ -348,7 +388,8 @@ route('DELETE', '/api/expenses/:id', async ({ user, params }) => {
 route('GET', '/api/history', async ({ user, query }) => {
   const month = query.get('month') || todayStr().slice(0, 7);
   if (!MONTH_RE.test(month) || !validDay(month + '-01')) throw bad('月份不对');
-  const uid = await targetUserId(user, query.get('user_id'));
+  const uid = await viewUserId(user, query.get('user_id'));
+  const mine = uid === user.id || user.is_admin;
   const from = month + '-01';
   const { rows } = await db.query(
     `SELECT ${EXP_COLS} FROM expenses
@@ -357,7 +398,7 @@ route('GET', '/api/history', async ({ user, query }) => {
   const days = new Map();
   let total = 0;
   for (const r of rows) {
-    if (!days.has(r.day)) days.set(r.day, { day: r.day, cents: 0, editable: canEditDay(user, r.day), items: [] });
+    if (!days.has(r.day)) days.set(r.day, { day: r.day, cents: 0, editable: mine && canEditDay(user, r.day), items: [] });
     const d = days.get(r.day);
     d.cents += r.cents; d.items.push(rowExpense(r)); total += r.cents;
   }
@@ -366,7 +407,7 @@ route('GET', '/api/history', async ({ user, query }) => {
 
 // 最近 30 天每日合计 + 本周/本月合计
 route('GET', '/api/stats', async ({ user, query }) => {
-  const uid = await targetUserId(user, query.get('user_id'));
+  const uid = await viewUserId(user, query.get('user_id'));
   const today = todayStr();
   const from = addDays(today, -29);
   const { rows } = await db.query(
@@ -394,19 +435,19 @@ route('GET', '/api/analytics', async ({ user, query }) => {
   const span = Math.round((Date.parse(to) - Date.parse(from)) / 86400000) + 1;
   if (span > 800) throw bad('时间范围太长');
   const all = user.is_admin && query.get('user_id') === 'all';
-  const uid = all ? null : await targetUserId(user, query.get('user_id'));
+  const uid = all ? null : await viewUserId(user, query.get('user_id'));
   const dept = all ? await adminDept(user, query.get('dept')) : null;
   // $1 from, $2 to, $3 uid（null=所有人）, $4 部门（只在所有人时生效）
   const SCOPE = `($3::int IS NULL OR user_id=$3) AND ($4::int IS NULL OR user_id IN (SELECT id FROM users WHERE dept_id=$4))`;
   const W = `day >= $1 AND day <= $2 AND ${SCOPE}`;
   const args = [from, to, uid, dept];
 
-  const [daily, meals, items, weekday, prev, monthly] = await Promise.all([
-    db.query(`SELECT to_char(day,'YYYY-MM-DD') AS day, SUM(cents)::int AS cents FROM expenses WHERE ${W} GROUP BY day`, args),
-    db.query(`SELECT meal, SUM(cents)::int AS cents, COUNT(*)::int AS n FROM expenses WHERE ${W} GROUP BY meal`, args),
+  const [byDayMeal, items, prev, monthly] = await Promise.all([
+    // 一次扫描按 (日期, 餐次) 汇总，日 / 餐次 / 星期 都从这里算
+    db.query(`SELECT to_char(day,'YYYY-MM-DD') AS day, EXTRACT(ISODOW FROM day)::int AS dow, meal,
+                     SUM(cents)::int AS cents, COUNT(*)::int AS n FROM expenses WHERE ${W} GROUP BY day, meal`, args),
     db.query(`SELECT item, SUM(cents)::int AS cents, COUNT(*)::int AS n FROM expenses WHERE ${W} AND item <> ''
               GROUP BY item ORDER BY SUM(cents) DESC, COUNT(*) DESC LIMIT 8`, args),
-    db.query(`SELECT EXTRACT(ISODOW FROM day)::int AS dow, SUM(cents)::int AS cents FROM expenses WHERE ${W} GROUP BY 1`, args),
     db.query(`SELECT COALESCE(SUM(cents),0)::int AS cents FROM expenses WHERE day >= $1 AND day <= $2 AND ${SCOPE}`,
               [addDays(from, -span), addDays(from, -1), uid, dept]),
     db.query(`SELECT to_char(date_trunc('month',day),'YYYY-MM') AS month, SUM(cents)::int AS cents FROM expenses
@@ -414,7 +455,13 @@ route('GET', '/api/analytics', async ({ user, query }) => {
               [to, to, uid, dept]),
   ]);
 
-  const dmap = new Map(daily.rows.map((r) => [r.day, r.cents]));
+  const dmap = new Map(), mealAgg = new Map(), dowAgg = new Map();
+  for (const r of byDayMeal.rows) {
+    dmap.set(r.day, (dmap.get(r.day) || 0) + r.cents);
+    const m = mealAgg.get(r.meal) || { cents: 0, n: 0 }; m.cents += r.cents; m.n += r.n; mealAgg.set(r.meal, m);
+    dowAgg.set(r.dow, (dowAgg.get(r.dow) || 0) + r.cents);
+  }
+  const daily = { rows: [...dmap.keys()] };
   const series = [];
   const dowDays = [0, 0, 0, 0, 0, 0, 0];
   for (let i = 0; i < span; i++) {
@@ -423,7 +470,7 @@ route('GET', '/api/analytics', async ({ user, query }) => {
     dowDays[(new Date(d + 'T00:00:00Z').getUTCDay() + 6) % 7]++;
   }
   const total = series.reduce((a, s) => a + s.cents, 0);
-  const wmap = new Map(weekday.rows.map((r) => [r.dow, r.cents]));
+  const wmap = dowAgg;
   const mmap = new Map(monthly.rows.map((r) => [r.month, r.cents]));
   const months = [];
   for (let i = 11; i >= 0; i--) {
@@ -438,7 +485,7 @@ route('GET', '/api/analytics', async ({ user, query }) => {
     recordedDays: daily.rows.length,
     avgPerDayCents: Math.round(total / span),
     series,
-    meals: MEALS.map((m) => { const r = meals.rows.find((x) => x.meal === m); return { meal: m, cents: r ? r.cents : 0, n: r ? r.n : 0 }; }),
+    meals: MEALS.map((m) => { const r = mealAgg.get(m); return { meal: m, cents: r ? r.cents : 0, n: r ? r.n : 0 }; }),
     weekday: dowDays.map((n, i) => ({ dow: i, avgCents: n ? Math.round((wmap.get(i + 1) || 0) / n) : 0 })),
     topItems: items.rows,
     months,
@@ -459,10 +506,14 @@ route('GET', '/api/analytics', async ({ user, query }) => {
     const { rows: [r30] } = await db.query(
       `SELECT COALESCE(SUM(cents),0)::int AS cents FROM expenses WHERE user_id=$1 AND day > $2 AND day <= $3`,
       [uid, addDays(today, -30), today]);
-    const bal = await balances(uid);
-    out.balanceCents = bal.balanceCents;
     out.avg30Cents = Math.round(r30.cents / 30);
-    out.runwayDays = out.avg30Cents > 0 ? Math.floor(bal.balanceCents / out.avg30Cents) : null;
+    if (uid === user.id || user.is_admin) {
+      const bal = await balances(uid);
+      out.balanceCents = bal.balanceCents;
+      out.runwayDays = out.avg30Cents > 0 ? Math.floor(bal.balanceCents / out.avg30Cents) : null;
+    } else {
+      out.balanceCents = null; out.runwayDays = null; out.hiddenBalance = true;   // 别人的余额不公开
+    }
   }
   return out;
 });
@@ -598,14 +649,15 @@ route('DELETE', '/api/topups/:id', async ({ user, params }) => {
 // ---------- 管理员 ----------
 route('GET', '/api/admin/users', async ({ user, query }) => {
   const dept = await adminDept(user, query.get('dept'));
-  const { rows } = await db.query(`
+  // 每人几个按索引的小查询（实测比整部门一次聚合快：最近一天走倒序索引、本月走日期索引）
+  const rows = await cached(`adminUsers:${dept}:${todayStr()}`, async () => (await db.query(`
     SELECT u.id,u.username,u.display_name,u.is_admin,u.is_super,u.dept_id,u.disabled,
       COALESCE((SELECT SUM(cents) FROM topups t WHERE t.user_id=u.id AND status='done'),0)
         - COALESCE((SELECT SUM(cents) FROM expenses e WHERE e.user_id=u.id),0) AS balance,
       COALESCE((SELECT SUM(cents) FROM expenses e WHERE e.user_id=u.id
         AND day >= date_trunc('month', $1::date)),0) AS month_spent,
       (SELECT to_char(MAX(day),'YYYY-MM-DD') FROM expenses e WHERE e.user_id=u.id) AS last_day
-    FROM users u WHERE u.dept_id=$2 ORDER BY u.disabled, u.id`, [todayStr(), dept]);
+    FROM users u WHERE u.dept_id=$2 ORDER BY u.disabled, u.id`, [todayStr(), dept])).rows);
   return rows.map((r) => ({
     id: r.id, username: r.username, displayName: r.display_name, isAdmin: r.is_admin || r.is_super, isSuper: r.is_super,
     deptId: r.dept_id, disabled: r.disabled,
@@ -769,15 +821,31 @@ route('GET', '/api/admin/expenses', async ({ user, query }) => {
 }, { auth: 'admin' });
 
 // ---------- 部门 ----------
+// 账单里"查看谁"的下拉：开了成员互相查看（或是管理员）才列出本部门其他人
+route('GET', '/api/members', async ({ user, query }) => {
+  const dept = user.is_admin ? await adminDept(user, query.get('dept')) : user.dept_id;
+  const { rows: [d] } = await db.query(`SELECT members_visible FROM departments WHERE id=$1`, [dept]);
+  if (!user.is_admin && !d.members_visible) return [];
+  const { rows } = await db.query(`SELECT id, display_name FROM users WHERE dept_id=$1 AND NOT disabled ORDER BY id`, [dept]);
+  return rows.map((r) => ({ id: r.id, name: r.display_name }));
+});
+// 开关"成员互相查看"：部门管理员管本部门，总管理员管任意部门
+route('PUT', '/api/admin/depts/:id/visibility', async ({ user, params, body }) => {
+  const id = params.id;
+  if (!user.is_super && id !== user.dept_id) throw new HttpError(404, '部门不存在');
+  const on = !!body.membersVisible;
+  const { rows: [d] } = await db.query(`UPDATE departments SET members_visible=$1 WHERE id=$2 RETURNING name`, [on, id]);
+  if (!d) throw new HttpError(404, '部门不存在');
+  await audit(db, user.id, null, 'dept.visibility', `「${d.name}」${on ? '开启' : '关闭'}成员互相查看消费记录`);
+  return { ok: true, membersVisible: on };
+}, { auth: 'admin' });
 // 部门列表：总管理员看全部，部门管理员只看自己部门
 route('GET', '/api/admin/depts', async ({ user }) => {
   const { rows } = await db.query(`
-    SELECT d.id, d.name,
-      (SELECT COUNT(*) FROM users u WHERE u.dept_id=d.id AND NOT u.disabled)::int AS members,
-      COALESCE((SELECT SUM(t.cents) FROM topups t JOIN users u ON u.id=t.user_id WHERE u.dept_id=d.id AND t.status='done'),0)
-        - COALESCE((SELECT SUM(e.cents) FROM expenses e JOIN users u ON u.id=e.user_id WHERE u.dept_id=d.id),0) AS pool
+    SELECT d.id, d.name, d.members_visible, (SELECT COUNT(*) FROM users u WHERE u.dept_id=d.id AND NOT u.disabled)::int AS members
     FROM departments d WHERE $1 OR d.id=$2 ORDER BY d.id`, [user.is_super, user.dept_id]);
-  return rows.map((r) => ({ id: r.id, name: r.name, members: r.members, poolCents: Number(r.pool) }));
+  const pools = await Promise.all(rows.map((r) => deptPool(r.id)));
+  return rows.map((r, i) => ({ id: r.id, name: r.name, members: r.members, membersVisible: r.members_visible, poolCents: pools[i] }));
 }, { auth: 'admin' });
 route('POST', '/api/admin/depts', async ({ user, body }) => {
   const name = cleanText(body.name, 20);
@@ -834,20 +902,39 @@ route('GET', '/api/admin/audit', async ({ user, query }) => {
 const PUBLIC = path.join(__dirname, 'public');
 const TYPES = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8',
   '.css': 'text/css; charset=utf-8', '.svg': 'image/svg+xml', '.json': 'application/manifest+json', '.png': 'image/png' };
+// 静态文件读进内存并算好 ETag；文件改动（mtime 变化）时自动重新读取
+const staticCache = new Map();
+function readStatic(file, cb) {
+  fs.stat(file, (err, st) => {
+    if (err || !st.isFile()) return cb(err || new Error('not a file'));
+    const hit = staticCache.get(file);
+    if (hit && hit.mtime === st.mtimeMs) return cb(null, hit);
+    fs.readFile(file, (err2, raw) => {
+      if (err2) return cb(err2);
+      let data = raw;
+      if (UMAMI && path.basename(file) === 'index.html') data = Buffer.from(raw.toString('utf8').replace('</head>', UMAMI + '</head>'));
+      const entry = { data, mtime: st.mtimeMs, etag: '"' + crypto.createHash('sha1').update(data).digest('base64url').slice(0, 16) + '"' };
+      staticCache.set(file, entry);
+      cb(null, entry);
+    });
+  });
+}
 function serveStatic(req, res, pathname) {
   let rel = pathname === '/' ? '/index.html' : pathname;
   const file = path.join(PUBLIC, path.normalize(rel).replace(/^(\.\.[/\\])+/, ''));
   if (!file.startsWith(PUBLIC + path.sep)) { res.writeHead(404); return res.end(); }
-  fs.readFile(file, (err, data) => {
+  readStatic(file, (err, entry) => {
     if (err) {
       // 前端路由兜底
       if (!path.extname(rel)) return serveStatic(req, res, '/');
       res.writeHead(404); return res.end('not found');
     }
-    if (UMAMI && path.basename(file) === 'index.html') data = Buffer.from(data.toString('utf8').replace('</head>', UMAMI + '</head>'));
-    res.writeHead(200, { 'Content-Type': TYPES[path.extname(file)] || 'application/octet-stream',
-      'Cache-Control': 'no-cache' });
-    res.end(data);
+    // 浏览器带着上次的 ETag 来问"有没有变"，没变就回 304，不再传文件内容（nginx 压缩时会加 W/ 前缀）
+    const inm = String(req.headers['if-none-match'] || '').split(',').map((x) => x.trim().replace(/^W\//, ''));
+    const headers = { 'Content-Type': TYPES[path.extname(file)] || 'application/octet-stream', 'Cache-Control': 'no-cache', ETag: entry.etag };
+    if (inm.includes(entry.etag)) { res.writeHead(304, headers); return res.end(); }
+    res.writeHead(200, { ...headers, 'Content-Length': entry.data.length });
+    res.end(req.method === 'HEAD' ? undefined : entry.data);
   });
 }
 
@@ -895,6 +982,7 @@ const server = http.createServer(async (req, res) => {
       if (r.auth === 'super' && !user.is_super) throw new HttpError(403, '需要总管理员权限');
     }
     const result = await r.handler({ req, res, user, params, body, query: url.searchParams });
+    if (req.method !== 'GET') invalidateCache();
     if (result && result.__file) {
       const f = result.__file;
       res.writeHead(200, { 'Content-Type': f.type, 'Content-Length': f.data.length, 'Cache-Control': 'no-store',

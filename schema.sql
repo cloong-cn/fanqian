@@ -78,3 +78,10 @@ ALTER TABLE users ADD COLUMN IF NOT EXISTS is_super boolean NOT NULL DEFAULT fal
 -- 升级时：还没有总管理员的话，把现有管理员设为总管理员（保证系统里总有人能管部门）
 UPDATE users SET is_super = true WHERE is_admin AND NOT disabled AND NOT EXISTS (SELECT 1 FROM users WHERE is_super AND NOT disabled);
 CREATE INDEX IF NOT EXISTS users_dept ON users(dept_id);
+
+-- 按日期范围统计（所有人 / 管理员消费列表）用的覆盖索引
+CREATE INDEX IF NOT EXISTS expenses_day ON expenses(day) INCLUDE (user_id, cents, meal);
+CREATE INDEX IF NOT EXISTS topups_user_status ON topups(user_id, status) INCLUDE (cents);
+
+-- 部门开关：成员之间能否互相查看消费记录（只读，不含个人余额）。默认关闭
+ALTER TABLE departments ADD COLUMN IF NOT EXISTS members_visible boolean NOT NULL DEFAULT false;

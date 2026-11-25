@@ -3,9 +3,13 @@
 // sheets: [{ name, columns: [{ header, width, type: 'text'|'money'|'int' }], rows: [[...]], totalRow?: [...] }]
 const zlib = require('node:zlib');
 
-const escXml = (s) => String(s ?? '')
-  .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f]/g, '')
-  .replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+const NEEDS_ESC = /[&<>"\u0000-\u0008\u000b\u000c\u000e-\u001f]/;
+const escXml = (v) => {
+  const s = String(v ?? '');
+  if (!NEEDS_ESC.test(s)) return s;   // 绝大多数单元格不需要转义，直接返回
+  return s.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f]/g, '')
+    .replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+};
 function colName(i) { let s = ''; i++; while (i) { const m = (i - 1) % 26; s = String.fromCharCode(65 + m) + s; i = Math.floor((i - 1) / 26); } return s; }
 
 // 样式索引：0 普通 1 表头 2 金额 3 整数 4 合计文字 5 合计金额 6 合计整数
@@ -15,20 +19,23 @@ const TOTAL_STYLE = { text: 4, money: 5, int: 6 };
 function cell(ref, v, type, style) {
   if (v === null || v === undefined || v === '') return `<c r="${ref}" s="${style}"/>`;
   if ((type === 'money' || type === 'int') && typeof v === 'number') return `<c r="${ref}" s="${style}"><v>${v}</v></c>`;
-  return `<c r="${ref}" s="${style}" t="inlineStr"><is><t xml:space="preserve">${escXml(v)}</t></is></c>`;
+  const t = escXml(v);
+  return `<c r="${ref}" s="${style}" t="inlineStr"><is><t${/^\s|\s$/.test(t) ? ' xml:space="preserve"' : ''}>${t}</t></is></c>`;
 }
 
 function sheetXml(sh) {
-  const cols = sh.columns;
-  const rows = [];
-  rows.push(`<row r="1">${cols.map((c, i) => cell(colName(i) + 1, c.header, 'text', 1)).join('')}</row>`);
-  sh.rows.forEach((r, ri) => {
-    rows.push(`<row r="${ri + 2}">${cols.map((c, i) => cell(colName(i) + (ri + 2), r[i], c.type || 'text', STYLE[c.type || 'text'])).join('')}</row>`);
-  });
-  if (sh.totalRow) {
-    const n = sh.rows.length + 2;
-    rows.push(`<row r="${n}">${cols.map((c, i) => cell(colName(i) + n, sh.totalRow[i], c.type || 'text', TOTAL_STYLE[c.type || 'text'])).join('')}</row>`);
-  }
+  const cols = sh.columns, n = cols.length;
+  const letters = cols.map((_, i) => colName(i));          // 列字母只算一次
+  const types = cols.map((c) => c.type || 'text');
+  const bodyStyle = types.map((t) => STYLE[t]), totalStyle = types.map((t) => TOTAL_STYLE[t]);
+  const rowXml = (r, vals, styles, forceText) => {
+    let x = `<row r="${r}">`;
+    for (let i = 0; i < n; i++) x += cell(letters[i] + r, vals[i], forceText ? 'text' : types[i], styles[i]);
+    return x + '</row>';
+  };
+  const rows = [rowXml(1, cols.map((c) => c.header), cols.map(() => 1), true)];
+  for (let ri = 0; ri < sh.rows.length; ri++) rows.push(rowXml(ri + 2, sh.rows[ri], bodyStyle));
+  if (sh.totalRow) rows.push(rowXml(sh.rows.length + 2, sh.totalRow, totalStyle));
   const last = colName(cols.length - 1) + (sh.rows.length + 1);
   return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
@@ -98,7 +105,7 @@ function zip(files) {
   const dosDate = ((now.getFullYear() - 1980) << 9) | ((now.getMonth() + 1) << 5) | now.getDate();
   for (const f of files) {
     const name = Buffer.from(f.name, 'utf8');
-    const comp = zlib.deflateRawSync(f.data);
+    const comp = zlib.deflateRawSync(f.data, { level: 3 });   // 压缩级别 3：比默认快约 3 倍，文件只大一点
     const crc = zlib.crc32(f.data);
     const lh = Buffer.alloc(30);
     lh.writeUInt32LE(0x04034b50, 0); lh.writeUInt16LE(20, 4); lh.writeUInt16LE(0x0800, 6); lh.writeUInt16LE(8, 8);
