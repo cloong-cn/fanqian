@@ -133,6 +133,8 @@ const ICONS = {
   stats: '<path d="M4 20V10M10 20V4M16 20v-7M21 20H3"/>',
   me: '<circle cx="12" cy="8" r="4"/><path d="M4 21c1.6-3.8 4.5-5.5 8-5.5s6.4 1.7 8 5.5"/>',
   admin: '<path d="M12 3l7.5 3v5.5c0 4.6-3.2 8.2-7.5 9.5-4.3-1.3-7.5-4.9-7.5-9.5V6z"/><path d="M9 12l2 2 4-4"/>',
+  eye: '<path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/>',
+  eyeOff: '<path d="M3 3l18 18M10.6 5.1A10.8 10.8 0 0 1 12 5c6.4 0 10 7 10 7a17.6 17.6 0 0 1-3.2 4.2M6.6 6.6C3.8 8.4 2 12 2 12s3.6 7 10 7a9.7 9.7 0 0 0 5.4-1.6M9.9 9.9a3 3 0 0 0 4.2 4.2"/>',
   plus: '<path d="M12 5v14M5 12h14"/>',
   chev: '<path d="M9 6l6 6-6 6"/>',
   left: '<path d="M15 6l-6 6 6 6"/>',
@@ -170,20 +172,35 @@ async function refreshMe() { me = await api('GET', '/api/me'); }
 
 // ---------- 登录 ----------
 function renderLogin() {
-  $app.innerHTML = `<form class="login" id="login">
+  // 表单用标准的 name/autocomplete，让手机自带的密码管理（iCloud 钥匙串 / Google 密码管理）能识别并记住
+  $app.innerHTML = `<form class="login" id="login" method="post" action="/api/login" autocomplete="on">
     <img class="logo" src="/icon.svg" alt="">
     <h1>饭钱账本</h1>
     <div class="tagline">记下每一顿，花得明明白白</div>
-    <div class="field"><input id="u" placeholder="用户名" autocomplete="username" autocapitalize="off" autocorrect="off" spellcheck="false" required></div>
-    <div class="field"><input id="p" type="password" placeholder="密码" autocomplete="current-password" required></div>
+    <div class="field"><input id="u" name="username" placeholder="用户名" autocomplete="username" autocapitalize="off" autocorrect="off" spellcheck="false" required></div>
+    <div class="field pw-field"><input id="p" name="password" type="password" placeholder="密码" autocomplete="current-password" required>
+      <button type="button" class="eye" id="eye" aria-label="显示密码">${icon('eye')}</button></div>
     <div class="err" id="err"></div>
-    <button class="btn block">登录</button>
+    <button class="btn block" type="submit">登录</button>
+    <div class="small muted" style="text-align:center;margin-top:14px">登录后 30 天内常用不用再输密码</div>
   </form>`;
+  trackPage('/login');
+  const pw = document.getElementById('p'), eye = document.getElementById('eye');
+  eye.onclick = () => {
+    const show = pw.type === 'password';
+    pw.type = show ? 'text' : 'password';
+    eye.innerHTML = icon(show ? 'eyeOff' : 'eye'); eye.setAttribute('aria-label', show ? '隐藏密码' : '显示密码');
+  };
   document.getElementById('login').addEventListener('submit', async (e) => {
     e.preventDefault();
     const btn = e.target.querySelector('button'); btn.disabled = true;
     try {
-      await api('POST', '/api/login', { username: document.getElementById('u').value, password: document.getElementById('p').value });
+      const username = document.getElementById('u').value, password = document.getElementById('p').value;
+      await api('POST', '/api/login', { username, password });
+      // 安卓 Chrome：主动请求浏览器保存账号密码（会弹出"保存密码？"）；Safari 不支持这个接口，靠上面的表单属性识别
+      if (window.PasswordCredential && navigator.credentials) {
+        try { await navigator.credentials.store(new PasswordCredential({ id: username.trim().toLowerCase(), password })); } catch {}
+      }
       await refreshMe(); route();
     } catch (err) { document.getElementById('err').textContent = err.message; }
     finally { btn.disabled = false; }
@@ -396,6 +413,7 @@ async function switchBill(tab) {
   state.billTab = tab; lsSet('cw.billTab', tab);
   billSwap = true; hideTip(); resizeHook = null;
   await (tab === 'stats' ? renderStats() : renderHistory());
+  trackPage(currentPagePath());
 }
 async function renderBill() {
   if (!state.billTab) state.billTab = lsGet('cw.billTab') === 'stats' ? 'stats' : 'detail';
@@ -811,7 +829,7 @@ async function renderAdmin() {
   else if (tab === 'audit') [body, mount] = await adminAudit();
   else [body, mount] = await adminExpenses();
   shell('admin', head + body, { pendingBadge: pending.length > 0 });
-  $app.querySelectorAll('[data-t]').forEach((b) => b.onclick = () => { state.adminTab = b.dataset.t; renderAdmin().catch(fail); });
+  $app.querySelectorAll('[data-t]').forEach((b) => b.onclick = () => { state.adminTab = b.dataset.t; renderAdmin().then(() => trackPage(currentPagePath())).catch(fail); });
   mount();
 }
 
@@ -1022,6 +1040,26 @@ async function adminExpenses() {
   return [html, mount];
 }
 
+// ---------- 访问统计（umami）----------
+// 本应用页面切换不改变网址路径，umami 默认只记第一次打开，所以每次切页手动上报一个"虚拟路径"。
+// 只上报页面名，不含金额、姓名等任何数据。index.html 里没放 umami 脚本时这里什么也不做。
+let lastTracked = '';
+function trackPage(path) {
+  if (path === lastTracked) return;
+  if (!window.umami || typeof window.umami.track !== 'function') return;   // 脚本还没加载好：先不记，加载后补报
+  lastTracked = path;
+  try { window.umami.track((p) => ({ ...p, url: path, title: '饭钱账本' })); } catch {}
+}
+function currentPagePath() {
+  const h = (location.hash.replace(/^#/, '') || '/');
+  if (!me) return '/login';
+  if (h === '/bill' || h === '/history' || h === '/stats') return '/bill/' + (state.billTab || 'detail');
+  if (h === '/admin') return '/admin/' + state.adminTab;
+  return h === '/' ? '/home' : h;
+}
+// 脚本异步加载，可能晚于第一次渲染；加载好后补报当前页
+window.addEventListener('load', () => setTimeout(() => trackPage(currentPagePath()), 300));
+
 // ---------- 路由 ----------
 async function route() {
   if (!me) return renderLogin();
@@ -1036,6 +1074,7 @@ async function route() {
     else if (h === '/admin' && me.user.isAdmin) await renderAdmin();
     else await renderHome();
     window.scrollTo(0, 0);
+    trackPage(currentPagePath());
   } catch (e) { if (me) fail(e); }
 }
 window.addEventListener('hashchange', () => { if (me) refreshMe().then(route).catch(() => {}); });
